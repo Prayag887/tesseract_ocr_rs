@@ -6,13 +6,31 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::local_ocr::LocalOcrEngine;
 use crate::ocr::{OcrDocument, PaddleOcrClient};
 use crate::scanner;
+
+/// Selected once at startup via `OCR_BACKEND` (default `local`): native
+/// in-process ONNX inference, or the original Python PaddleX HTTP sidecar
+/// kept as a rollback path.
+pub enum OcrBackend {
+    Local(LocalOcrEngine),
+    Paddle(PaddleOcrClient),
+}
+
+impl OcrBackend {
+    pub async fn extract(&self, image: &[u8]) -> Result<OcrDocument, AppError> {
+        match self {
+            OcrBackend::Local(engine) => engine.extract(image).await,
+            OcrBackend::Paddle(client) => client.extract(image).await,
+        }
+    }
+}
 
 pub struct AppState {
     pub output_dir: std::path::PathBuf,
     pub detector: scanner::DocDetector,
-    pub ocr: PaddleOcrClient,
+    pub ocr: OcrBackend,
 }
 
 #[derive(Serialize)]

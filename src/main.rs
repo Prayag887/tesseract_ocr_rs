@@ -1,4 +1,5 @@
 mod error;
+mod local_ocr;
 mod ocr;
 mod routes;
 mod scanner;
@@ -11,7 +12,7 @@ use axum::routing::{get, post};
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
-use routes::AppState;
+use routes::{AppState, OcrBackend};
 
 const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024; // 25 MB
 
@@ -23,7 +24,17 @@ async fn main() {
     std::fs::create_dir_all(&output_dir).expect("failed to create scanned_document directory");
 
     let detector = scanner::DocDetector::load().expect("failed to load document detection model");
-    let ocr = ocr::PaddleOcrClient::from_env().expect("failed to configure PP-OCRv5 client");
+    let ocr_backend = std::env::var("OCR_BACKEND").unwrap_or_else(|_| "local".to_owned());
+    let ocr = match ocr_backend.as_str() {
+        "local" => OcrBackend::Local(
+            local_ocr::LocalOcrEngine::load().expect("failed to load native OCR models"),
+        ),
+        "paddlex" => OcrBackend::Paddle(
+            ocr::PaddleOcrClient::from_env().expect("failed to configure PP-OCRv5 client"),
+        ),
+        other => panic!("invalid OCR_BACKEND {other:?}, expected \"local\" or \"paddlex\""),
+    };
+    tracing::info!(backend = %ocr_backend, "OCR backend selected");
 
     let state = Arc::new(AppState {
         output_dir: output_dir.clone(),

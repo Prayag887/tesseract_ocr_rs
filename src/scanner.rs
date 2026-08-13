@@ -30,20 +30,24 @@ pub struct ScanOutput {
 /// are already in memory.
 pub struct DocDetector(Mutex<dnn::Net>);
 
-/// DocAligner's `lcnet050` point-regression model (Apache-2.0,
-/// github.com/DocsaidLab/DocAligner): a PP-LCNet-0.5 backbone trained to
-/// regress the 4 corners of a document directly, in one forward pass, with
-/// no edges/contours/color-segmentation heuristics involved. Runs at a
-/// fixed 256x256 input, so it costs the same few milliseconds regardless of
-/// the source photo's resolution — verified at ~5ms/image on CPU, an
-/// improvement of nearly 3 orders of magnitude over the classical CV
-/// pipeline it replaces (which additionally could not find the document at
-/// all on some real, cluttered photos; this model does).
-const MODEL_PATH: &str = "models/docaligner_lcnet050.onnx";
+/// DocAligner's `fastvit_sa24` heatmap-regression model (Apache-2.0,
+/// github.com/DocsaidLab/DocAligner): a FastViT-SA24 backbone + BiFPN neck
+/// predicting one heatmap per corner rather than regressing point
+/// coordinates directly. DocAligner's own README documents why: a
+/// point-regression head trained at a fixed low resolution (256x256)
+/// suffers "amplification error" — a ~5-10px shift once the predicted
+/// point is scaled back up to the original photo's resolution, since a
+/// whole neighborhood of source pixels collapses to one predicted pixel.
+/// A heatmap only has to say "the corner is roughly here", so upscaling
+/// its centroid to the original resolution doesn't carry that fixed
+/// pixel-error term — the accuracy gain this swap is for. Runs at the same
+/// fixed 256x256 input as the point model it replaces.
+const MODEL_PATH: &str = "models/docaligner_lcnet100.onnx";
 const MODEL_INPUT_SIZE: i32 = 256;
-/// Below this the model itself is saying "I don't think there's a document
-/// here" — matches the threshold DocAligner's own reference code uses.
-const HAS_OBJ_THRESHOLD: f32 = 0.5;
+/// Below this, a corner's heatmap is treated as empty (no document edge
+/// found there) — matches DocAligner's own reference postprocessing
+/// (`heatmap_threshold` in `heatmap_reg/infer.py`).
+const HEATMAP_THRESHOLD: f64 = 0.3;
 
 impl DocDetector {
     pub fn load() -> Result<Self, AppError> {
@@ -53,18 +57,22 @@ impl DocDetector {
 
     /// Runs the model on `image` (full resolution — the fixed 256x256 input
     /// means there's no separate "detection copy" to manage) and returns
-    /// its 4 corners in `image`'s own pixel space, or `None` if the model's
-    /// own confidence is below [`HAS_OBJ_THRESHOLD`].
+    /// its 4 corners in `image`'s own pixel space, or `None` if any of the
+    /// 4 corners' heatmaps came back empty (no document found there).
     fn detect(&self, image: &Mat) -> Result<Option<[Point2f; 4]>, AppError> {
         let size = image.size().map_err(AppError::Processing)?;
-        let (orig_w, orig_h) = (size.width as f32, size.height as f32);
+        let (orig_w, orig_h) = (size.width, size.height);
 
+        // Same preprocessing as the point model this replaces: scale to
+        // [0,1], no mean/std subtraction (DocAligner's heatmap preprocess
+        // is a plain `/255`), BGR->RGB since imdecode gives BGR and the
+        // model was trained on RGB.
         let blob = dnn::blob_from_image(
             image,
             1.0 / 255.0,
             Size::new(MODEL_INPUT_SIZE, MODEL_INPUT_SIZE),
             Scalar::all(0.0),
-            true, // swapRB: model was trained on RGB, imdecode gives BGR
+            true,
             false,
             opencv::core::CV_32F,
         )?;
@@ -73,28 +81,109 @@ impl DocDetector {
         net.set_input(&blob, "img", 1.0, Scalar::all(0.0))?;
 
         let mut outputs = Vector::<Mat>::new();
-        let names = Vector::<String>::from_iter(["points", "has_obj"]);
+        let names = Vector::<String>::from_iter(["heatmap"]);
         net.forward(&mut outputs, &names)?;
         drop(net);
 
-        let has_obj: f32 = *outputs.get(1)?.at(0)?;
-        if has_obj < HAS_OBJ_THRESHOLD {
-            return Ok(None);
+        // heatmap is [1, 4, H, W] — one channel per corner, in
+        // [top-left, top-right, bottom-right, bottom-left] order (verified
+        // against a real scan: each channel's peak lands where that corner
+        // visually is). Already sigmoid-activated by the exported graph.
+        let heatmap = outputs.get(0)?;
+        let dims = heatmap.mat_size();
+        let (map_h, map_w) = (dims[2], dims[3]);
+
+        let mut corners = [Point2f::new(0.0, 0.0); 4];
+        for (channel, corner) in corners.iter_mut().enumerate() {
+            let Some(point) = largest_heatmap_blob_centroid(&heatmap, channel, map_h, map_w, orig_w, orig_h)?
+            else {
+                return Ok(None);
+            };
+            *corner = point;
         }
 
-        // `points` is [1, 8]: 4 (x, y) pairs, each a fraction (0..1) of the
-        // *original* image's own width/height — the model's own postprocess
-        // convention, not relative to the 256x256 input it actually saw.
-        let points = outputs.get(0)?;
-        let mut corners = [Point2f::new(0.0, 0.0); 4];
-        for i in 0..4 {
-            let x: f32 = *points.at(2 * i)?;
-            let y: f32 = *points.at(2 * i + 1)?;
-            corners[i as usize] = Point2f::new(x * orig_w, y * orig_h);
-        }
-        let corners = expand_quad(order_corners(&corners), orig_w, orig_h);
+        let corners = expand_quad(order_corners(&corners), orig_w as f32, orig_h as f32);
         Ok(Some(corners))
     }
+}
+
+/// Extracts channel `channel` of a `[1, 4, H, W]` heatmap tensor, upscales
+/// it to the original image's resolution, thresholds it, and returns the
+/// centroid of its largest connected blob — DocAligner's own
+/// heatmap-to-corner postprocessing (`heatmap_reg/infer.py`: resize,
+/// threshold, binarize, take the largest-area polygon's centroid).
+/// Upscaling *before* thresholding (rather than finding a peak at the
+/// heatmap's native low resolution and scaling that single point up) is
+/// what avoids reintroducing the same fixed pixel-error the heatmap
+/// architecture exists to avoid.
+fn largest_heatmap_blob_centroid(
+    heatmap: &Mat,
+    channel: usize,
+    map_h: i32,
+    map_w: i32,
+    orig_w: i32,
+    orig_h: i32,
+) -> Result<Option<Point2f>, AppError> {
+    let plane_len = (map_h * map_w) as usize;
+    // heatmap is a contiguous [1, 4, H, W] tensor fresh off the network, so
+    // it can be read as one flat row-major slice and sliced per channel
+    // rather than indexed element-by-element.
+    let data = heatmap.data_typed::<f32>()?;
+    let start = channel * plane_len;
+    let plane = &data[start..start + plane_len];
+    let plane_mat = Mat::new_rows_cols_with_data(map_h, map_w, plane)?.try_clone()?;
+
+    let mut upscaled = Mat::default();
+    imgproc::resize(
+        &plane_mat,
+        &mut upscaled,
+        Size::new(orig_w, orig_h),
+        0.0,
+        0.0,
+        imgproc::INTER_LINEAR,
+    )?;
+
+    let mut binary = Mat::default();
+    imgproc::threshold(
+        &upscaled,
+        &mut binary,
+        HEATMAP_THRESHOLD,
+        255.0,
+        imgproc::THRESH_BINARY,
+    )?;
+    let mut binary_u8 = Mat::default();
+    binary.convert_to(&mut binary_u8, opencv::core::CV_8U, 1.0, 0.0)?;
+
+    let mut contours = Vector::<Vector<opencv::core::Point>>::new();
+    imgproc::find_contours_def(
+        &binary_u8,
+        &mut contours,
+        imgproc::RETR_LIST,
+        imgproc::CHAIN_APPROX_SIMPLE,
+    )?;
+
+    let mut best: Option<(f64, opencv::core::Moments)> = None;
+    for contour in &contours {
+        let area = geometry::contour_area_def(&contour)?;
+        if area <= 0.0 {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(best_area, _)| area > *best_area) {
+            let moments = geometry::moments(&contour, false)?;
+            best = Some((area, moments));
+        }
+    }
+
+    let Some((_, moments)) = best else {
+        return Ok(None);
+    };
+    if moments.m00 == 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(Point2f::new(
+        (moments.m10 / moments.m00) as f32,
+        (moments.m01 / moments.m00) as f32,
+    )))
 }
 
 /// The model's predicted edge tends to land a hair inside the document's
