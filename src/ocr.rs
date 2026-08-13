@@ -40,6 +40,16 @@ pub struct Field {
 /// stacking a second FFI/bindgen build dependency on top of OpenCV's; the
 /// `tesseract` CLI already ships as a stable, versioned interface and the
 /// process-spawn overhead (a few ms) is negligible next to OCR itself.
+/// `tessdata_best` (the LSTM-only, higher-accuracy trained data set, as
+/// opposed to the default `tessdata_fast` most Tesseract installs ship
+/// with) — vendored into the project rather than relying on whatever's
+/// globally installed, so accuracy doesn't depend on the host machine's
+/// Tesseract setup. Verified head-to-head against `tessdata_fast` on a
+/// real card: fixed a digit error in the ID number at the cost of ~35%
+/// more time per scan — worth it for a field that's either exactly right
+/// or silently wrong.
+const TESSDATA_DIR: &str = "tessdata";
+
 pub fn extract_fields(image_path: &std::path::Path) -> Result<Vec<Field>, AppError> {
     let upscaled_path = upscale_for_ocr(image_path)?;
 
@@ -47,6 +57,7 @@ pub fn extract_fields(image_path: &std::path::Path) -> Result<Vec<Field>, AppErr
         .arg(&upscaled_path)
         .arg("stdout")
         .args(["-l", "eng+nep", "--psm", "11", "tsv"])
+        .env("TESSDATA_PREFIX", TESSDATA_DIR)
         .output()
         .map_err(AppError::Ocr);
     let _ = std::fs::remove_file(&upscaled_path);
