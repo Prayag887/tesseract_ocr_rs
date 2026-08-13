@@ -94,6 +94,9 @@
       <h3>Scanned</h3>
       <img id="result" style="display:none">
       <div id="meta"></div>
+      <h3 style="margin-top:1rem">Extracted fields</h3>
+      <div id="fieldsStatus" style="font-size:0.85rem; opacity:0.7"></div>
+      <pre id="fields" style="display:none; font-size:0.85rem; background:rgba(128,128,128,0.1); border-radius:6px; padding:0.75rem; overflow-x:auto;"></pre>
     </div>
   </div>
 
@@ -110,6 +113,8 @@ const result = document.getElementById('result');
 const statusEl = document.getElementById('status');
 const metaEl = document.getElementById('meta');
 const errorEl = document.getElementById('error');
+const fieldsStatusEl = document.getElementById('fieldsStatus');
+const fieldsEl = document.getElementById('fields');
 
 let currentFile = null;
 let scanId = null;
@@ -153,6 +158,8 @@ function setFile(file) {
   metaEl.textContent = '';
   errorEl.textContent = '';
   statusEl.textContent = '';
+  fieldsStatusEl.textContent = '';
+  fieldsEl.style.display = 'none';
   scanId = null;
   detectedCorners = null;
   corners = null;
@@ -182,6 +189,7 @@ scanBtn.addEventListener('click', async () => {
     statusEl.textContent = data.corners_detected
       ? 'Done. Drag the corners below if the crop needs adjusting.'
       : 'No document edges detected — drag the corners to mark it manually.';
+    runExtraction();
   } catch (err) {
     errorEl.textContent = err.message;
     statusEl.textContent = '';
@@ -189,6 +197,24 @@ scanBtn.addEventListener('click', async () => {
     scanBtn.disabled = false;
   }
 });
+
+async function runExtraction() {
+  if (!scanId) return;
+  fieldsEl.style.display = 'none';
+  fieldsStatusEl.textContent = 'Reading text...';
+  try {
+    const res = await fetch(`/extract/${scanId}`, { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || `HTTP ${res.status}`);
+    }
+    fieldsEl.textContent = JSON.stringify(data, null, 2);
+    fieldsEl.style.display = 'block';
+    fieldsStatusEl.textContent = '';
+  } catch (err) {
+    fieldsStatusEl.textContent = `Text extraction failed: ${err.message}`;
+  }
+}
 
 function showResult(filename, meta) {
   result.src = `/scanned_document/${filename}?t=${Date.now()}`;
@@ -283,6 +309,7 @@ applyCropBtn.addEventListener('click', async () => {
     }
     showResult(data.filename, { corners_detected: true, width: data.width, height: data.height });
     statusEl.textContent = 'Crop applied.';
+    runExtraction();
   } catch (err) {
     errorEl.textContent = err.message;
     statusEl.textContent = '';

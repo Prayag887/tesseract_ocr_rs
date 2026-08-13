@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::ocr::{self, Field};
 use crate::scanner;
 
 pub struct AppState {
@@ -122,4 +123,22 @@ pub async fn crop(
         width: output.width,
         height: output.height,
     }))
+}
+
+pub async fn extract(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<Field>>, AppError> {
+    let path = state.output_dir.join(format!("{id}.jpg"));
+    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return Err(AppError::NotFound);
+    }
+
+    // Shells out to the `tesseract` CLI; run on the blocking pool like the
+    // other CPU/process-bound work so it doesn't stall the async reactor.
+    let fields = tokio::task::spawn_blocking(move || ocr::extract_fields(&path))
+        .await
+        .expect("extract_fields panicked")?;
+
+    Ok(Json(fields))
 }

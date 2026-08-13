@@ -19,6 +19,10 @@ pub enum AppError {
     Io(#[source] std::io::Error),
     #[error("multipart error: {0}")]
     Multipart(#[from] axum::extract::multipart::MultipartError),
+    #[error("failed to run tesseract: {0}")]
+    Ocr(#[source] std::io::Error),
+    #[error("tesseract exited with an error: {0}")]
+    OcrFailed(String),
 }
 
 impl From<opencv::Error> for AppError {
@@ -35,7 +39,9 @@ impl IntoResponse for AppError {
             }
             AppError::NotFound => StatusCode::NOT_FOUND,
             AppError::Multipart(_) => StatusCode::BAD_REQUEST,
-            AppError::Processing(_) | AppError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::Processing(_) | AppError::Io(_) | AppError::Ocr(_) | AppError::OcrFailed(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
         let body = Json(json!({ "error": self.to_string() }));
         (status, body).into_response()

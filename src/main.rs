@@ -1,4 +1,5 @@
 mod error;
+mod ocr;
 mod routes;
 mod scanner;
 
@@ -32,6 +33,7 @@ async fn main() {
         .route("/health", get(routes::health))
         .route("/scan", post(routes::scan))
         .route("/crop/{id}", post(routes::crop))
+        .route("/extract/{id}", post(routes::extract))
         .nest_service("/scanned_document", ServeDir::new(&output_dir))
         .fallback_service(ServeDir::new("static"))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
