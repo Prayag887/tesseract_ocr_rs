@@ -5,9 +5,9 @@ mod scanner;
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
-use axum::Router;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
@@ -23,10 +23,12 @@ async fn main() {
     std::fs::create_dir_all(&output_dir).expect("failed to create scanned_document directory");
 
     let detector = scanner::DocDetector::load().expect("failed to load document detection model");
+    let ocr = ocr::PaddleOcrClient::from_env().expect("failed to configure PP-OCRv5 client");
 
     let state = Arc::new(AppState {
         output_dir: output_dir.clone(),
         detector,
+        ocr,
     });
 
     let app = Router::new()

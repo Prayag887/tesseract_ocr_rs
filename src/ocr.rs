@@ -1,413 +1,1005 @@
-use std::process::Command;
-use std::sync::LazyLock;
+use std::cmp::Ordering;
+use std::time::Duration;
 
-use opencv::core::{Size, Vector};
-use opencv::prelude::*;
-use opencv::{imgcodecs, imgproc};
-use regex::Regex;
-use serde::Serialize;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use reqwest::{Client, Url};
+use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 use crate::error::AppError;
 
-/// A single label → value pair read off the document, in the order the
-/// labels appear top-to-bottom. A plain `Vec` of pairs (not a `HashMap`)
-/// because label text is whatever the document happens to print — nothing
-/// here is a fixed schema, so there's no fixed set of keys to hang a map
-/// off of, and preserving document order is more useful for display than
-/// alphabetical/hash order would be.
-#[derive(Serialize)]
+const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8080/ocr";
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_QUEUE_TIMEOUT_MILLIS: u64 = 2_000;
+const DEFAULT_MAX_CONCURRENCY: usize = 1;
+const DEFAULT_MIN_CONFIDENCE: f32 = 0.45;
+const FIELD_LABEL_MIN_CONFIDENCE: f32 = 0.90;
+const FIELD_VALUE_MIN_CONFIDENCE: f32 = 0.75;
+const MAX_FIELD_ALIGNMENT_DRIFT: i32 = 120;
+
+#[derive(Debug, PartialEq)]
+struct OcrLine {
+    text: String,
+    confidence: f32,
+    polygon: [[i32; 2]; 4],
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Field {
     pub label: String,
     pub value: String,
 }
 
-/// Runs Tesseract (`eng+nep`, sparse-text mode — the ID card's watermark
-/// background merges label text into unreadable blobs under the default
-/// "assume a uniform block" mode; sparse mode looks for isolated text
-/// regions instead, which is a much closer match for a card layout) on
-/// `image_path` and pulls out every label/value pair it can find.
-///
-/// This makes no assumption about which document or which side of it is
-/// being read: it doesn't look for "NATIONALITY" or "SEX" by name, it
-/// looks for *the shape* a label takes on this kind of document (a short
-/// run of Latin capitals — how every label on both sides of this card is
-/// printed) and pairs each one with whatever text sits nearest below it.
-/// Swap in the back of the card, or a different document with the same
-/// labels-in-capitals convention, and it extracts whatever's actually
-/// there instead of a fixed set of fields that may not apply.
-///
-/// Runs as a subprocess rather than linking libtesseract directly — avoids
-/// stacking a second FFI/bindgen build dependency on top of OpenCV's; the
-/// `tesseract` CLI already ships as a stable, versioned interface and the
-/// process-spawn overhead (a few ms) is negligible next to OCR itself.
-/// `tessdata_best` (the LSTM-only, higher-accuracy trained data set, as
-/// opposed to the default `tessdata_fast` most Tesseract installs ship
-/// with) — vendored into the project rather than relying on whatever's
-/// globally installed, so accuracy doesn't depend on the host machine's
-/// Tesseract setup. Verified head-to-head against `tessdata_fast` on a
-/// real card: fixed a digit error in the ID number at the cost of ~35%
-/// more time per scan — worth it for a field that's either exactly right
-/// or silently wrong.
-const TESSDATA_DIR: &str = "tessdata";
+#[derive(Debug, Serialize, PartialEq)]
+pub struct OcrDocument {
+    pub fields: Vec<Field>,
+}
 
-pub fn extract_fields(image_path: &std::path::Path) -> Result<Vec<Field>, AppError> {
-    let upscaled_path = upscale_for_ocr(image_path)?;
+pub struct PaddleOcrClient {
+    http: Client,
+    endpoint: Url,
+    api_key: Option<String>,
+    permits: Semaphore,
+    queue_timeout: Duration,
+    min_confidence: f32,
+}
 
-    let output = Command::new("tesseract")
-        .arg(&upscaled_path)
-        .arg("stdout")
-        .args(["-l", "eng+nep", "--psm", "11", "tsv"])
-        .env("TESSDATA_PREFIX", TESSDATA_DIR)
-        .output()
-        .map_err(AppError::Ocr);
-    let _ = std::fs::remove_file(&upscaled_path);
-    let output = output?;
+impl PaddleOcrClient {
+    pub fn from_env() -> Result<Self, AppError> {
+        let endpoint = std::env::var("PADDLE_OCR_URL")
+            .unwrap_or_else(|_| DEFAULT_ENDPOINT.to_owned())
+            .parse::<Url>()
+            .map_err(|error| AppError::OcrConfig(format!("invalid PADDLE_OCR_URL: {error}")))?;
+        let request_timeout = Duration::from_secs(env_number(
+            "PADDLE_OCR_TIMEOUT_SECS",
+            DEFAULT_REQUEST_TIMEOUT_SECS,
+        )?);
+        let queue_timeout = Duration::from_millis(env_number(
+            "PADDLE_OCR_QUEUE_TIMEOUT_MS",
+            DEFAULT_QUEUE_TIMEOUT_MILLIS,
+        )?);
+        let max_concurrency = env_number("PADDLE_OCR_MAX_CONCURRENCY", DEFAULT_MAX_CONCURRENCY)?;
+        if max_concurrency == 0 {
+            return Err(AppError::OcrConfig(
+                "PADDLE_OCR_MAX_CONCURRENCY must be greater than zero".to_owned(),
+            ));
+        }
+        let min_confidence = env_number("PADDLE_OCR_MIN_CONFIDENCE", DEFAULT_MIN_CONFIDENCE)?;
+        if !(0.0..=1.0).contains(&min_confidence) {
+            return Err(AppError::OcrConfig(
+                "PADDLE_OCR_MIN_CONFIDENCE must be between 0 and 1".to_owned(),
+            ));
+        }
 
-    if !output.status.success() {
-        return Err(AppError::OcrFailed(
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ));
+        Self::new(
+            endpoint,
+            std::env::var("PADDLE_OCR_API_KEY").ok(),
+            max_concurrency,
+            request_timeout,
+            queue_timeout,
+            min_confidence,
+        )
     }
 
-    let tsv = String::from_utf8_lossy(&output.stdout);
-    let lines = group_lines(&tsv);
-    Ok(parse_fields(&lines))
-}
+    fn new(
+        endpoint: Url,
+        api_key: Option<String>,
+        max_concurrency: usize,
+        request_timeout: Duration,
+        queue_timeout: Duration,
+        min_confidence: f32,
+    ) -> Result<Self, AppError> {
+        let http = Client::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(request_timeout)
+            .pool_max_idle_per_host(max_concurrency)
+            .build()
+            .map_err(AppError::OcrTransport)?;
 
-/// 2x upscale factor fed to Tesseract. The smallest text on this card (a
-/// vertically-printed ID number, Devanagari numerals) is only a handful of
-/// pixels tall at the crop's native resolution — too small for Tesseract's
-/// character shapes to resolve reliably. Verified experimentally: the same
-/// crop upscaled 2x turned a garbled misread of that number into an exact
-/// match, with no measurable loss of accuracy on text that was already
-/// reading fine at native size.
-const OCR_UPSCALE_FACTOR: f64 = 2.0;
-
-/// Writes a 2x-upscaled copy of `image_path` to a temp file and returns its
-/// path; the caller is responsible for deleting it once Tesseract is done.
-fn upscale_for_ocr(image_path: &std::path::Path) -> Result<std::path::PathBuf, AppError> {
-    let image = imgcodecs::imread(image_path, imgcodecs::IMREAD_COLOR)
-        .map_err(AppError::Processing)?;
-    let size = image.size().map_err(AppError::Processing)?;
-
-    let mut upscaled = Mat::default();
-    imgproc::resize(
-        &image,
-        &mut upscaled,
-        Size::new(
-            (size.width as f64 * OCR_UPSCALE_FACTOR).round() as i32,
-            (size.height as f64 * OCR_UPSCALE_FACTOR).round() as i32,
-        ),
-        0.0,
-        0.0,
-        imgproc::INTER_CUBIC,
-    )
-    .map_err(AppError::Processing)?;
-
-    let out_path = std::env::temp_dir().join(format!("ocr-{}.png", uuid::Uuid::new_v4()));
-    let mut buf = Vector::<u8>::new();
-    imgcodecs::imencode(".png", &upscaled, &mut buf, &Vector::new()).map_err(AppError::Processing)?;
-    std::fs::write(&out_path, buf.as_slice()).map_err(AppError::Io)?;
-
-    Ok(out_path)
-}
-
-/// One OCR'd line: its words joined in reading order, plus the position
-/// (top-left corner of the line's bounding box) used both to keep lines in
-/// reading order and to tell which column a line belongs to.
-struct Line {
-    top: i32,
-    left: i32,
-    text: String,
-}
-
-/// Minimum word confidence (Tesseract's own 0-100 score) to trust. Low-conf
-/// hits are almost always the card's decorative watermark/background
-/// pattern getting misread as text, not an OCR engine being unsure about
-/// real text — including them just adds noise to the label/value matching
-/// below.
-const MIN_WORD_CONFIDENCE: f32 = 40.0;
-
-/// Groups Tesseract's word-level TSV rows into lines using its own
-/// `block/par/line` grouping (columns 3-5) — even in sparse mode this
-/// reliably keeps horizontally-aligned words (e.g. "DATE" "OF" "BIRTH")
-/// together, so there's no need to re-derive line grouping from raw y
-/// coordinates.
-fn group_lines(tsv: &str) -> Vec<Line> {
-    let mut grouped: Vec<((i32, i32, i32), (i32, i32), Vec<(i32, String)>)> = Vec::new();
-
-    for row in tsv.lines().skip(1) {
-        let cols: Vec<&str> = row.split('\t').collect();
-        if cols.len() < 12 {
-            continue;
-        }
-        let Ok(block) = cols[2].parse::<i32>() else {
-            continue;
-        };
-        let Ok(par) = cols[3].parse::<i32>() else {
-            continue;
-        };
-        let Ok(line_num) = cols[4].parse::<i32>() else {
-            continue;
-        };
-        let Ok(word_num) = cols[5].parse::<i32>() else {
-            continue;
-        };
-        let Ok(left) = cols[6].parse::<i32>() else {
-            continue;
-        };
-        let Ok(top) = cols[7].parse::<i32>() else {
-            continue;
-        };
-        let Ok(conf) = cols[10].parse::<f32>() else {
-            continue;
-        };
-        let text = cols[11].trim();
-        if conf < MIN_WORD_CONFIDENCE || text.is_empty() {
-            continue;
-        }
-
-        let key = (block, par, line_num);
-        match grouped.iter_mut().find(|(k, _, _)| *k == key) {
-            Some((_, min_pos, words)) => {
-                min_pos.0 = min_pos.0.min(top);
-                min_pos.1 = min_pos.1.min(left);
-                words.push((word_num, text.to_string()));
-            }
-            None => grouped.push((key, (top, left), vec![(word_num, text.to_string())])),
-        }
-    }
-
-    let mut lines: Vec<Line> = grouped
-        .into_iter()
-        .map(|(_, (top, left), mut words)| {
-            words.sort_by_key(|(word_num, _)| *word_num);
-            let text = words
-                .into_iter()
-                .map(|(_, w)| w)
-                .collect::<Vec<_>>()
-                .join(" ");
-            Line { top, left, text }
+        Ok(Self {
+            http,
+            endpoint,
+            api_key,
+            permits: Semaphore::new(max_concurrency),
+            queue_timeout,
+            min_confidence,
         })
-        .collect();
-    lines.sort_by_key(|l| l.top);
-    lines
+    }
+
+    pub async fn extract(&self, image: &[u8]) -> Result<OcrDocument, AppError> {
+        let _permit = tokio::time::timeout(self.queue_timeout, self.permits.acquire())
+            .await
+            .map_err(|_| AppError::OcrQueueTimeout)?
+            .map_err(|_| AppError::OcrUnavailable)?;
+
+        // Paddle's service contract requires Base64 in JSON. This is the only
+        // full-image encoding allocation; the source image and encoded string
+        // are borrowed everywhere else in the request path.
+        let encoded_len = image
+            .len()
+            .checked_add(2)
+            .and_then(|len| len.checked_div(3))
+            .and_then(|len| len.checked_mul(4))
+            .ok_or(AppError::OcrInputTooLarge)?;
+        let mut encoded = String::with_capacity(encoded_len);
+        BASE64.encode_string(image, &mut encoded);
+
+        let payload = PaddleRequest {
+            file: &encoded,
+            file_type: 1,
+            use_doc_orientation_classify: false,
+            use_doc_unwarping: false,
+            use_textline_orientation: true,
+            text_rec_score_thresh: self.min_confidence,
+            visualize: false,
+        };
+
+        let mut request = self.http.post(self.endpoint.as_str()).json(&payload);
+        if let Some(api_key) = self.api_key.as_deref() {
+            request = request.bearer_auth(api_key);
+        }
+
+        let response = request.send().await.map_err(AppError::OcrTransport)?;
+        if !response.status().is_success() {
+            return Err(AppError::OcrRejected(response.status().as_u16()));
+        }
+
+        let response = response
+            .json::<PaddleResponse>()
+            .await
+            .map_err(AppError::OcrTransport)?;
+        if response.error_code != 0 {
+            return Err(AppError::OcrRejected(response.error_code));
+        }
+        let result = response.result.ok_or(AppError::OcrProtocol(
+            "PP-OCRv5 response did not contain a result",
+        ))?;
+
+        let mut lines = Vec::new();
+        for page in result.ocr_results {
+            let PaddlePrunedResult {
+                rec_texts,
+                rec_scores,
+                rec_polys,
+            } = page.pruned_result;
+            if rec_texts.len() != rec_scores.len() || rec_texts.len() != rec_polys.len() {
+                return Err(AppError::OcrProtocol(
+                    "PP-OCRv5 returned mismatched text, score, and polygon counts",
+                ));
+            }
+            lines.reserve(rec_texts.len());
+            for ((text, confidence), polygon) in
+                rec_texts.into_iter().zip(rec_scores).zip(rec_polys)
+            {
+                let text = text.trim();
+                if !text.is_empty() && confidence >= self.min_confidence {
+                    lines.push(OcrLine {
+                        text: text.to_owned(),
+                        confidence,
+                        polygon,
+                    });
+                }
+            }
+        }
+
+        lines.sort_by(reading_order);
+        let fields = parse_fields(&lines);
+
+        Ok(OcrDocument { fields })
+    }
 }
 
-/// A field label on this card is printed as a short run of Latin capitals
-/// ("NATIONALITY", "DATE OF ISSUE", "SEX", "PERMANENT ADDRESS", ...) —
-/// every value, by contrast, is either title/mixed-case Latin, a number, or
-/// Devanagari. That single, content-agnostic shape is what identifies a
-/// label; the label *text itself* is never matched against a fixed list,
-/// so whatever labels actually appear on whichever side of whichever
-/// document gets read.
-///
-/// Matched as a substring (`find`), not anchored to the whole line
-/// (`^...$`) — bilingual labels on this card (Nepali caption + English
-/// caption printed on the same physical row, e.g. "नागरिकताको किसिम |
-/// CITIZENSHIP TYPE") land in Tesseract's OCR as one combined line, and an
-/// anchored match would reject the whole thing for containing Devanagari.
-/// Extracting just the matched run doubles as cleanup: the label ends up
-/// as "CITIZENSHIP TYPE", not the raw bilingual line.
-static LABEL_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[A-Z][A-Z .,'&/-]*[A-Z]").expect("valid regex"));
-
-/// Below this, a token like "M" or "OK" would satisfy [`LABEL_PATTERN`] and
-/// get mistaken for a label instead of a value — genuine labels on this
-/// card are all several characters long ("SEX" is the shortest real one).
-const MIN_LABEL_LEN: usize = 3;
-
-/// Returns the label text if `text` contains one, cleaned to just the
-/// matched capitals run (see [`LABEL_PATTERN`] for why that's not simply
-/// the whole line).
-fn label_in(text: &str) -> Option<&str> {
-    LABEL_PATTERN
-        .find(text)
-        .map(|m| m.as_str())
-        .filter(|m| m.chars().count() >= MIN_LABEL_LEN)
+fn env_number<T>(name: &'static str, default: T) -> Result<T, AppError>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<T>()
+            .map_err(|error| AppError::OcrConfig(format!("invalid {name}: {error}"))),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(AppError::OcrConfig(format!("invalid {name}: {error}"))),
+    }
 }
 
-/// Rejects near-empty OCR noise (stray punctuation, a short misread
-/// fragment) from being accepted as a value just because it happened to be
-/// the nearest non-label line — a real value has some actual content.
-/// A plain "≥2 alphanumeric characters" bar isn't tight enough on its own:
-/// it let a 2-letter garbled fragment ("Ax", misread background texture)
-/// through as a value on a real scan. But single/double-character values
-/// are also completely legitimate — a gender letter (M/F/O), a 2-digit
-/// code — so short values are still allowed when they're purely digits or
-/// a single letter, just not an arbitrary short run of Latin letters
-/// (which real field values essentially never are; real short words are
-/// several characters even in Devanagari, where syllable-per-character
-/// packs more into fewer codepoints).
-fn looks_like_value(text: &str) -> bool {
-    let alnum_count = text.chars().filter(|c| c.is_alphanumeric()).count();
-    if alnum_count == 0 {
-        return false;
-    }
-    let trimmed = text.trim();
-    let digit_count = trimmed.chars().filter(|c| c.is_ascii_digit()).count();
-    if digit_count >= 2 && trimmed.chars().all(|c| c.is_ascii_digit() || !c.is_alphanumeric()) {
-        return true; // numeric codes ("01", NIN, ...) — a lone stray digit is noise, not a code
-    }
-    if alnum_count == 1 {
-        return trimmed
-            .chars()
-            .find(|c| c.is_alphabetic())
-            .is_some_and(|c| c.is_uppercase());
-    }
-    alnum_count >= 3
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PaddleRequest<'a> {
+    file: &'a str,
+    file_type: u8,
+    use_doc_orientation_classify: bool,
+    use_doc_unwarping: bool,
+    use_textline_orientation: bool,
+    text_rec_score_thresh: f32,
+    visualize: bool,
 }
 
-// These three are distances in the *OCR'd* image's pixel space, which is
-// [`OCR_UPSCALE_FACTOR`]x the crop's real resolution since that's what
-// actually gets fed to Tesseract — they need to scale with it, or an
-// upscale-factor change silently shrinks the effective search windows
-// (caught in testing: raising the factor made a label lose its already-
-// correctly-positioned value because the gap between them, unchanged in
-// real terms, now measured as more OCR pixels than the fixed threshold
-// allowed).
-/// How far below a label its value is expected to sit. Generous on
-/// purpose — cards get scanned at a range of resolutions.
-const MAX_ROW_DISTANCE: i32 = (140.0 * OCR_UPSCALE_FACTOR) as i32;
-/// How far consecutive lines of an already-started, wrapped value (e.g. an
-/// address spanning two printed lines) may sit from each other. Tighter
-/// than [`MAX_ROW_DISTANCE`] since these are lines known to belong to the
-/// same value, not a value being searched for — they're expected to sit
-/// right under one another.
-const MAX_CONTINUATION_GAP: i32 = (70.0 * OCR_UPSCALE_FACTOR) as i32;
-/// A value can wrap onto at most this many printed lines before the search
-/// gives up extending it — caps how far a bad match can run away.
-const MAX_VALUE_LINES: usize = 3;
-/// How far a value's left edge may drift from its label's left edge and
-/// still count as "the same column". This card's layout is two-column
-/// (e.g. NATIONALITY on the left, NIN on the right, at similar heights) —
-/// without this, "nearest line below" regularly grabs a value from the
-/// *other* column that merely happens to sit at a closer y.
-const MAX_COLUMN_DRIFT: i32 = (260.0 * OCR_UPSCALE_FACTOR) as i32;
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PaddleResponse {
+    error_code: u16,
+    result: Option<PaddleResult>,
+}
 
-/// A value that's itself a `YYYY-MM-DD` date, embedded in a longer OCR'd
-/// line — pulled out on its own when present. Not a document-specific
-/// rule: any label whose nearest line happens to contain a date benefits,
-/// regardless of what the label says. Restricted to ASCII digits
-/// deliberately: Rust's `regex` crate is Unicode-aware by default, so a
-/// plain `\d` would also match Devanagari digits (U+0966-U+096F) — this
-/// card prints most dates twice, once in each script, and the point of
-/// this pattern is to prefer the Latin-digit copy over its Devanagari twin
-/// when both land on the same OCR'd line.
-static DATE_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[0-9]{4}-[0-9]{2}-[0-9]{2}").expect("valid regex"));
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PaddleResult {
+    #[serde(default)]
+    ocr_results: Vec<PaddlePage>,
+}
 
-/// This card prints several fields (names, address, dates, ID numbers) in
-/// both Devanagari and Latin script, side by side or stacked, as two full
-/// alternate renderings rather than one embedded token. Both are real,
-/// useful content — a Nepali name has no "correct" Latin spelling to fall
-/// back to — so rather than picking one script and discarding the other,
-/// each label gets a value from *each* script that has a plausible nearby
-/// candidate: same label, two `Field` entries when both scripts are
-/// present, one when only one is.
-static DEVANAGARI_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[\u{0900}-\u{097F}]").expect("valid regex"));
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PaddlePage {
+    pruned_result: PaddlePrunedResult,
+}
 
-fn parse_fields(lines: &[Line]) -> Vec<Field> {
+#[derive(Deserialize)]
+struct PaddlePrunedResult {
+    #[serde(default)]
+    rec_texts: Vec<String>,
+    #[serde(default)]
+    rec_scores: Vec<f32>,
+    #[serde(default)]
+    rec_polys: Vec<[[i32; 2]; 4]>,
+}
+
+fn reading_order(a: &OcrLine, b: &OcrLine) -> Ordering {
+    let a_top = a.polygon.iter().map(|point| point[1]).min().unwrap_or(0);
+    let b_top = b.polygon.iter().map(|point| point[1]).min().unwrap_or(0);
+    let a_left = a.polygon.iter().map(|point| point[0]).min().unwrap_or(0);
+    let b_left = b.polygon.iter().map(|point| point[0]).min().unwrap_or(0);
+    a_top.cmp(&b_top).then_with(|| a_left.cmp(&b_left))
+}
+
+fn parse_fields(lines: &[OcrLine]) -> Vec<Field> {
+    let generic = parse_generic_fields(lines);
+    if is_national_identity_card(lines) {
+        return parse_national_identity_fields(lines, &generic);
+    }
+    if is_citizenship_card(lines) {
+        return parse_citizenship_fields(lines, &generic);
+    }
+    generic
+}
+
+fn parse_generic_fields(lines: &[OcrLine]) -> Vec<Field> {
     let mut fields = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if let Some((label, value)) = line.text.split_once(':')
+            && let Some(field) = make_field(label, value)
+        {
+            fields.push((index, field));
+        }
+    }
 
-    for (i, line) in lines.iter().enumerate() {
-        let Some(label) = label_in(&line.text) else {
+    for mut label_group in connected_line_groups(lines, is_field_label) {
+        label_group.sort_unstable_by_key(|&index| line_left(&lines[index]));
+        let bounds = group_bounds(lines, &label_group);
+        let Some(anchor) = lines
+            .iter()
+            .enumerate()
+            .filter(|(index, candidate)| {
+                !label_group.contains(index)
+                    && candidate.confidence >= FIELD_VALUE_MIN_CONFIDENCE
+                    && !is_field_label(candidate)
+            })
+            .filter(|(_, candidate)| {
+                is_below(bounds, candidate)
+                    && vertical_gap_from(bounds, candidate) <= bounds.height().saturating_mul(4)
+                    && left_distance(bounds.left, candidate) <= MAX_FIELD_ALIGNMENT_DRIFT
+            })
+            .min_by_key(|(_, candidate)| {
+                (
+                    vertical_gap_from(bounds, candidate),
+                    left_distance(bounds.left, candidate),
+                )
+            })
+            .map(|(index, _)| index)
+        else {
             continue;
         };
 
-        let candidates = || {
-            lines[i + 1..]
-                .iter()
-                .take_while(|l| l.top - line.top <= MAX_ROW_DISTANCE)
-                .filter(|l| label_in(&l.text).is_none() && looks_like_value(&l.text))
-        };
-        // Require the same column (this card's layout is multi-column, so
-        // the nearest line by row alone is often a value from an unrelated
-        // field — picking whatever's nearest regardless of column reliably
-        // grabs the wrong one).
-        let same_column =
-            || candidates().filter(|l| (l.left - line.left).abs() <= MAX_COLUMN_DRIFT);
+        let mut value_group = value_group_from(lines, anchor, |line| {
+            line.confidence >= FIELD_VALUE_MIN_CONFIDENCE && !is_field_label(line)
+        });
+        value_group.sort_unstable_by_key(|&index| line_left(&lines[index]));
 
-        let latin = same_column().find(|l| !DEVANAGARI_PATTERN.is_match(&l.text));
-        let devanagari = same_column().find(|l| DEVANAGARI_PATTERN.is_match(&l.text));
-
-        for value_line in [latin, devanagari].into_iter().flatten() {
-            fields.push(Field {
-                label: label.to_string(),
-                value: collect_wrapped_value(lines, i, value_line),
-            });
-        }
-
-        // A same-column match can still miss entirely: a value printed in
-        // two scripts on one OCR line (e.g. a date in both Devanagari and
-        // Latin digits) gets grouped with a `left` anchored to whichever
-        // script is more to the left, which can legitimately fall outside
-        // the label's column even though it's the right line. For that
-        // specific, self-validating case — not for arbitrary text, which
-        // would just as often grab the wrong neighboring field — fall back
-        // to a date pattern found anywhere in the row window regardless of
-        // column.
-        if latin.is_none() && devanagari.is_none() {
-            if let Some(date) = candidates().find_map(|l| DATE_PATTERN.find(&l.text)) {
-                fields.push(Field {
-                    label: label.to_string(),
-                    value: date.as_str().to_string(),
-                });
-            }
+        let label = join_line_text(lines, &label_group);
+        let value = join_line_text(lines, &value_group);
+        if let Some(field) = make_field(&label, &value) {
+            fields.push((*label_group.iter().min().unwrap_or(&anchor), field));
         }
     }
+    fields.sort_unstable_by_key(|(index, _)| *index);
+    fields.into_iter().map(|(_, field)| field).collect()
+}
+
+fn is_national_identity_card(lines: &[OcrLine]) -> bool {
+    has_line(lines, "IDENTITY") && has_line(lines, "NATIONALITY") && has_line(lines, "FULL NAME")
+}
+
+fn is_citizenship_card(lines: &[OcrLine]) -> bool {
+    has_line(lines, "CITIZENSHIP TYPE") && has_line(lines, "ICC NUMBER")
+}
+
+fn has_line(lines: &[OcrLine], needle: &str) -> bool {
+    lines.iter().any(|line| line.text.contains(needle))
+}
+
+fn parse_national_identity_fields(lines: &[OcrLine], generic: &[Field]) -> Vec<Field> {
+    let mut fields = Vec::with_capacity(6);
+
+    let id_values = lines
+        .iter()
+        .position(|line| line.text.contains("परिचय"))
+        .map(|label| {
+            lines[label + 1..]
+                .iter()
+                .take_while(|line| !line.text.contains("नाम"))
+                .filter(|line| is_identity_number(&line.text))
+                .map(|line| line.text.as_str())
+        })
+        .and_then(join_unique);
+    push_owned_field(&mut fields, "NATIONAL ID NUMBER", id_values);
+
+    push_borrowed_field(
+        &mut fields,
+        "NATIONALITY",
+        field_value(generic, "NATIONALITY"),
+    );
+
+    let nepali_name = lines
+        .iter()
+        .position(|line| line.text.contains("नाम") && line.text.contains("थर"))
+        .map(|label| {
+            let mut indexes = lines[label + 1..]
+                .iter()
+                .take_while(|line| !line.text.contains("FULL NAME"))
+                .enumerate()
+                .filter_map(|(offset, line)| {
+                    (line.confidence >= FIELD_VALUE_MIN_CONFIDENCE
+                        && contains_devanagari(&line.text)
+                        && !line.text.chars().any(|character| character.is_numeric()))
+                    .then_some(label + 1 + offset)
+                })
+                .collect::<Vec<_>>();
+            indexes.sort_unstable_by_key(|&index| line_left(&lines[index]));
+            join_line_text(lines, &indexes)
+        })
+        .filter(|name| !name.is_empty());
+    let full_name = join_unique(
+        [nepali_name.as_deref(), field_value(generic, "FULL NAME")]
+            .into_iter()
+            .flatten(),
+    );
+    push_owned_field(&mut fields, "FULL NAME", full_name);
+
+    let issue_date = field_value(generic, "DATE OF ISSUE");
+    push_borrowed_field(&mut fields, "DATE OF ISSUE", issue_date);
+
+    let birth_dates = join_unique(
+        lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .filter(|text| is_date(text))
+            .filter(|text| Some(*text) != issue_date),
+    );
+    push_owned_field(&mut fields, "DATE OF BIRTH", birth_dates);
+
+    let nepali_sex = lines
+        .iter()
+        .map(|line| line.text.trim())
+        .find(|text| matches!(*text, "पुरुष" | "पुरूष" | "महिला" | "अन्य"));
+    let sex = join_unique(
+        [nepali_sex, field_value(generic, "SEX")]
+            .into_iter()
+            .flatten(),
+    );
+    push_owned_field(&mut fields, "SEX", sex);
 
     fields
 }
 
-/// Starting from `first` (the closest matching line to the label), keeps
-/// pulling in following lines that look like a continuation of the same
-/// value — same column, close enough below the previous line to be a
-/// wrapped second row rather than the next field — up to
-/// [`MAX_VALUE_LINES`]. Handles values that print across two lines (an
-/// address is the case that motivated this; a long name would hit the same
-/// thing) without needing to know in advance which labels tend to wrap.
-fn collect_wrapped_value(lines: &[Line], label_index: usize, first: &Line) -> String {
-    let mut parts = vec![first.text.as_str()];
-    let mut prev = first;
+fn parse_citizenship_fields(lines: &[OcrLine], generic: &[Field]) -> Vec<Field> {
+    let mut fields = Vec::with_capacity(4);
+    let english_address = lines
+        .iter()
+        .position(|line| line.text.contains("PERMANENT ADDRESS"))
+        .and_then(|label| {
+            lines[label + 1..]
+                .iter()
+                .take_while(|line| !line.text.contains("CITIZENSHIP TYPE"))
+                .find(|line| {
+                    line.text
+                        .chars()
+                        .any(|character| character.is_ascii_lowercase())
+                })
+        })
+        .map(|line| line.text.as_str());
+    let address = join_unique(
+        [field_value(generic, "PERMANENT ADDRESS"), english_address]
+            .into_iter()
+            .flatten(),
+    );
+    push_owned_field(&mut fields, "PERMANENT ADDRESS", address);
+    push_borrowed_field(&mut fields, "NICIN", field_value(generic, "NICIN"));
+    push_borrowed_field(
+        &mut fields,
+        "CITIZENSHIP TYPE",
+        field_value(generic, "CITIZENSHIP TYPE"),
+    );
+    push_borrowed_field(
+        &mut fields,
+        "CITIZENSHIP NUMBER",
+        field_value(generic, "ICC NUMBER"),
+    );
+    fields
+}
 
-    for line in &lines[label_index + 1..] {
-        if parts.len() >= MAX_VALUE_LINES {
-            break;
+fn field_value<'a>(fields: &'a [Field], label: &str) -> Option<&'a str> {
+    fields
+        .iter()
+        .find(|field| field.label.contains(label))
+        .map(|field| field.value.as_str())
+}
+
+fn push_borrowed_field(fields: &mut Vec<Field>, label: &str, value: Option<&str>) {
+    if let Some(value) = value
+        && let Some(field) = make_field(label, value)
+    {
+        fields.push(field);
+    }
+}
+
+fn push_owned_field(fields: &mut Vec<Field>, label: &str, value: Option<String>) {
+    if let Some(value) = value {
+        push_borrowed_field(fields, label, Some(&value));
+    }
+}
+
+fn join_unique<'a>(values: impl Iterator<Item = &'a str>) -> Option<String> {
+    let mut unique = Vec::new();
+    for value in values.map(str::trim).filter(|value| !value.is_empty()) {
+        if !unique.contains(&value) {
+            unique.push(value);
         }
-        // Skip lines already consumed up to and including `first`.
-        if line.top <= first.top {
-            continue;
+    }
+    if unique.is_empty() {
+        return None;
+    }
+    let capacity = unique
+        .iter()
+        .map(|value| value.len())
+        .sum::<usize>()
+        .saturating_add(unique.len().saturating_sub(1).saturating_mul(3));
+    let mut joined = String::with_capacity(capacity);
+    for value in unique {
+        if !joined.is_empty() {
+            joined.push_str(" / ");
         }
-        if line.top - prev.top > MAX_CONTINUATION_GAP {
-            break;
+        joined.push_str(value);
+    }
+    Some(joined)
+}
+
+fn is_identity_number(text: &str) -> bool {
+    digit_group_lengths(text) == [3, 3, 4]
+}
+
+fn is_date(text: &str) -> bool {
+    digit_group_lengths(text) == [4, 2, 2]
+}
+
+fn digit_group_lengths(text: &str) -> [usize; 3] {
+    let mut lengths = [0; 3];
+    let mut groups = text.trim().split('-');
+    for length in &mut lengths {
+        let Some(group) = groups.next() else {
+            return [0; 3];
+        };
+        if !group.chars().all(|character| character.is_numeric()) {
+            return [0; 3];
         }
-        if label_in(&line.text).is_some() || !looks_like_value(&line.text) {
-            break;
+        *length = group.chars().count();
+    }
+    if groups.next().is_some() {
+        return [0; 3];
+    }
+    lengths
+}
+
+fn contains_devanagari(text: &str) -> bool {
+    text.chars()
+        .any(|character| ('\u{0900}'..='\u{097f}').contains(&character))
+}
+
+fn is_field_label(line: &OcrLine) -> bool {
+    line.confidence >= FIELD_LABEL_MIN_CONFIDENCE && looks_like_label(&line.text)
+}
+
+fn looks_like_label(text: &str) -> bool {
+    let mut uppercase_ascii = 0;
+    for character in text.chars() {
+        if character.is_ascii_lowercase() {
+            return false;
         }
-        if (line.left - first.left).abs() > MAX_COLUMN_DRIFT {
-            break;
+        uppercase_ascii += usize::from(character.is_ascii_uppercase());
+    }
+    uppercase_ascii >= 2
+}
+
+fn connected_line_groups(
+    lines: &[OcrLine],
+    include: impl Fn(&OcrLine) -> bool + Copy,
+) -> Vec<Vec<usize>> {
+    let mut remaining = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| include(line).then_some(index))
+        .collect::<Vec<_>>();
+    let mut groups = Vec::new();
+    while let Some(seed) = remaining.pop() {
+        let group = connected_group(lines, seed, &mut remaining);
+        groups.push(group);
+    }
+    groups
+}
+
+fn value_group_from(
+    lines: &[OcrLine],
+    seed: usize,
+    include: impl Fn(&OcrLine) -> bool,
+) -> Vec<usize> {
+    let mut group = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            (index != seed && include(line) && lines_share_value_row(&lines[seed], line))
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    group.push(seed);
+    group
+}
+
+fn connected_group(lines: &[OcrLine], seed: usize, remaining: &mut Vec<usize>) -> Vec<usize> {
+    let mut group = vec![seed];
+    while let Some(position) = remaining.iter().position(|candidate| {
+        group
+            .iter()
+            .any(|member| lines_share_row(&lines[*member], &lines[*candidate]))
+    }) {
+        group.push(remaining.swap_remove(position));
+    }
+    group
+}
+
+fn lines_share_row(a: &OcrLine, b: &OcrLine) -> bool {
+    let a_bounds = Bounds::from_line(a);
+    let b_bounds = Bounds::from_line(b);
+    let overlaps_vertically = a_bounds.top < b_bounds.bottom && b_bounds.top < a_bounds.bottom;
+    let horizontal_gap = if a_bounds.right < b_bounds.left {
+        b_bounds.left - a_bounds.right
+    } else if b_bounds.right < a_bounds.left {
+        a_bounds.left - b_bounds.right
+    } else {
+        0
+    };
+    overlaps_vertically
+        && horizontal_gap <= a_bounds.height().max(b_bounds.height()).saturating_mul(2)
+}
+
+fn lines_share_value_row(a: &OcrLine, b: &OcrLine) -> bool {
+    let a_bounds = Bounds::from_line(a);
+    let b_bounds = Bounds::from_line(b);
+    let center_distance = (a_bounds.top + a_bounds.bottom)
+        .abs_diff(b_bounds.top + b_bounds.bottom)
+        .saturating_div(2);
+    let max_height = a_bounds.height().max(b_bounds.height());
+    let horizontal_gap = if a_bounds.right < b_bounds.left {
+        b_bounds.left - a_bounds.right
+    } else if b_bounds.right < a_bounds.left {
+        a_bounds.left - b_bounds.right
+    } else {
+        0
+    };
+    center_distance <= max_height.saturating_div(2) as u32 && horizontal_gap <= max_height
+}
+
+#[derive(Clone, Copy)]
+struct Bounds {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+impl Bounds {
+    fn from_line(line: &OcrLine) -> Self {
+        Self {
+            left: line_left(line),
+            top: line.polygon.iter().map(|point| point[1]).min().unwrap_or(0),
+            right: line.polygon.iter().map(|point| point[0]).max().unwrap_or(0),
+            bottom: line.polygon.iter().map(|point| point[1]).max().unwrap_or(0),
         }
-        // Don't mix scripts into one value — a Devanagari line right below
-        // a Latin one is virtually always the *other* rendering of the
-        // same field (see the script-preference note above [`parse_fields`]),
-        // not a second line of the same rendering.
-        if DEVANAGARI_PATTERN.is_match(&line.text) != DEVANAGARI_PATTERN.is_match(&first.text) {
-            break;
-        }
-        parts.push(line.text.as_str());
-        prev = line;
     }
 
-    let joined = DATE_PATTERN
-        .find(first.text.as_str())
-        .map(|m| m.as_str().to_string());
-    match joined {
-        // A wrapped-value search only makes sense for text; a date is a
-        // single self-contained token, so isolate it same as elsewhere
-        // rather than appending unrelated following lines to it.
-        Some(date) => date,
-        None => parts.join(" "),
+    fn height(self) -> i32 {
+        self.bottom.saturating_sub(self.top).max(1)
+    }
+}
+
+fn group_bounds(lines: &[OcrLine], indexes: &[usize]) -> Bounds {
+    indexes.iter().fold(
+        Bounds {
+            left: i32::MAX,
+            top: i32::MAX,
+            right: i32::MIN,
+            bottom: i32::MIN,
+        },
+        |bounds, &index| {
+            let line = Bounds::from_line(&lines[index]);
+            Bounds {
+                left: bounds.left.min(line.left),
+                top: bounds.top.min(line.top),
+                right: bounds.right.max(line.right),
+                bottom: bounds.bottom.max(line.bottom),
+            }
+        },
+    )
+}
+
+fn line_left(line: &OcrLine) -> i32 {
+    line.polygon.iter().map(|point| point[0]).min().unwrap_or(0)
+}
+
+fn vertical_gap_from(label: Bounds, value: &OcrLine) -> i32 {
+    let value_top = value
+        .polygon
+        .iter()
+        .map(|point| point[1])
+        .min()
+        .unwrap_or(0);
+    value_top.saturating_sub(label.bottom)
+}
+
+fn is_below(label: Bounds, value: &OcrLine) -> bool {
+    let value_top = value
+        .polygon
+        .iter()
+        .map(|point| point[1])
+        .min()
+        .unwrap_or(0);
+    value_top
+        >= label
+            .bottom
+            .saturating_sub(label.height().saturating_div(2))
+}
+
+fn left_distance(label_left: i32, value: &OcrLine) -> i32 {
+    label_left
+        .abs_diff(line_left(value))
+        .try_into()
+        .unwrap_or(i32::MAX)
+}
+
+fn join_line_text(lines: &[OcrLine], indexes: &[usize]) -> String {
+    let capacity = indexes
+        .iter()
+        .map(|&index| lines[index].text.len())
+        .sum::<usize>()
+        .saturating_add(indexes.len().saturating_sub(1));
+    let mut text = String::with_capacity(capacity);
+    for &index in indexes {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(&lines[index].text);
+    }
+    text
+}
+
+fn make_field(label: &str, value: &str) -> Option<Field> {
+    let label = label.trim().trim_matches('*').trim();
+    let value = value.trim().trim_matches('*').trim();
+    (!label.is_empty() && !value.is_empty()).then(|| Field {
+        label: label.to_owned(),
+        value: value.to_owned(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::Json;
+    use axum::Router;
+    use axum::routing::post;
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    fn line(text: &str, confidence: f32, left: i32, top: i32) -> OcrLine {
+        line_with_width(text, confidence, left, top, 100)
+    }
+
+    fn line_with_width(text: &str, confidence: f32, left: i32, top: i32, width: i32) -> OcrLine {
+        OcrLine {
+            text: text.to_owned(),
+            confidence,
+            polygon: [
+                [left, top],
+                [left + width, top],
+                [left + width, top + 20],
+                [left, top + 20],
+            ],
+        }
+    }
+
+    #[test]
+    fn extracts_inline_and_spatial_fields() {
+        let lines = vec![
+            line("NAME", 0.99, 10, 10),
+            line("Prayag", 0.98, 12, 40),
+            line("NATIONALITY: Nepali", 0.97, 10, 80),
+        ];
+
+        assert_eq!(
+            parse_fields(&lines),
+            vec![
+                Field {
+                    label: "NAME".to_owned(),
+                    value: "Prayag".to_owned(),
+                },
+                Field {
+                    label: "NATIONALITY".to_owned(),
+                    value: "Nepali".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn treats_devanagari_text_as_a_value_without_an_english_label() {
+        let lines = vec![
+            line("नागरिकताको किसिम I CITIZENSHIP TYPE", 0.99, 10, 10),
+            line("जारी गर्ने अधिकारी ISSUING OFFICER", 0.99, 1_000, 10),
+            line("वंशज", 0.98, 12, 40),
+        ];
+
+        assert_eq!(
+            parse_fields(&lines),
+            vec![Field {
+                label: "नागरिकताको किसिम I CITIZENSHIP TYPE".to_owned(),
+                value: "वंशज".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn joins_split_labels_and_values_on_the_same_row() {
+        let lines = vec![
+            line("DATE", 0.99, 10, 10),
+            line("OF", 0.99, 112, 10),
+            line("ISSUE", 0.99, 214, 10),
+            line("2024-02-15", 0.99, 12, 40),
+            line("FULL NAME", 0.99, 10, 80),
+            line_with_width("Prayag", 0.99, 12, 110, 100),
+            line_with_width("Dhakal", 0.99, 120, 110, 100),
+        ];
+
+        assert_eq!(
+            parse_fields(&lines),
+            vec![
+                Field {
+                    label: "DATE OF ISSUE".to_owned(),
+                    value: "2024-02-15".to_owned(),
+                },
+                Field {
+                    label: "FULL NAME".to_owned(),
+                    value: "Prayag Dhakal".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn omits_low_confidence_and_unaligned_field_guesses() {
+        let lines = vec![
+            line("GOVERNMENTIOFI", 0.88, 500, 10),
+            line("noise", 0.90, 500, 40),
+            line("NATIONAL IDENTITY CARD", 0.99, 500, 80),
+            line("712-322-1775", 0.99, 200, 110),
+            line("SEX", 0.99, 10, 150),
+            line("M", 0.99, 12, 180),
+        ];
+
+        assert_eq!(
+            parse_fields(&lines),
+            vec![Field {
+                label: "SEX".to_owned(),
+                value: "M".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn returns_all_person_fields_from_a_national_identity_card() {
+        let lines = vec![
+            line_with_width("NATIONAL IDENTITY CARD", 0.99, 500, 10, 300),
+            line("राष्ट्रिय परिचय नम्बर", 0.95, 500, 50),
+            line("NATIONALITY", 0.99, 10, 50),
+            line("Nepali", 0.99, 12, 80),
+            line_with_width("७१२-३२२-१७७४", 0.96, 500, 80, 180),
+            line_with_width("712-322-1775", 0.99, 500, 110, 180),
+            line("नाम थर", 0.99, 500, 150),
+            line("प्रयाग", 0.99, 500, 180),
+            line("ढकाल", 0.99, 608, 180),
+            line("FULL NAME", 0.99, 500, 220),
+            line("Prayag", 0.99, 500, 250),
+            line("Dhakal", 0.99, 608, 250),
+            line("DATE", 0.99, 10, 290),
+            line("OF", 0.99, 112, 290),
+            line("ISSUE", 0.99, 214, 290),
+            line("2024-02-15", 0.99, 12, 320),
+            line("जन्म मिति", 0.99, 10, 360),
+            line("DATE", 0.99, 500, 360),
+            line("OF", 0.99, 602, 360),
+            line("BIRTH", 0.99, 704, 360),
+            line("२०५६-०७-२३", 0.99, 10, 390),
+            line("1999-11-09", 0.99, 500, 390),
+            line("लिङ्ग", 0.99, 10, 430),
+            line("SEX", 0.99, 500, 430),
+            line("पुरूष", 0.99, 10, 460),
+            line("M", 0.99, 500, 460),
+        ];
+
+        assert_eq!(
+            parse_fields(&lines),
+            vec![
+                Field {
+                    label: "NATIONAL ID NUMBER".to_owned(),
+                    value: "७१२-३२२-१७७४ / 712-322-1775".to_owned(),
+                },
+                Field {
+                    label: "NATIONALITY".to_owned(),
+                    value: "Nepali".to_owned(),
+                },
+                Field {
+                    label: "FULL NAME".to_owned(),
+                    value: "प्रयाग ढकाल / Prayag Dhakal".to_owned(),
+                },
+                Field {
+                    label: "DATE OF ISSUE".to_owned(),
+                    value: "2024-02-15".to_owned(),
+                },
+                Field {
+                    label: "DATE OF BIRTH".to_owned(),
+                    value: "२०५६-०७-२३ / 1999-11-09".to_owned(),
+                },
+                Field {
+                    label: "SEX".to_owned(),
+                    value: "पुरूष / M".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn returns_clean_bilingual_citizenship_fields() {
+        let lines = vec![
+            line("स्थायी ठेगाना I PERMANENT ADDRESS", 0.99, 10, 10),
+            line("NICIN", 0.99, 500, 10),
+            line("सूर्यविनायक नगरपालिका-४, भक्तपुर", 0.99, 12, 40),
+            line("01", 0.99, 502, 40),
+            line("Suryabinayak Municipality-4, Bhaktapur", 0.99, 12, 70),
+            line("नागरिकताको किसिम I CITIZENSHIP TYPE", 0.99, 10, 110),
+            line("वंशज", 0.99, 12, 140),
+            line("नागरिकता न. ICC NUMBER", 0.99, 10, 180),
+            line("०४-०२-७३-०००१९", 0.99, 12, 210),
+        ];
+
+        assert_eq!(
+            parse_fields(&lines),
+            vec![
+                Field {
+                    label: "PERMANENT ADDRESS".to_owned(),
+                    value: "सूर्यविनायक नगरपालिका-४, भक्तपुर / Suryabinayak Municipality-4, Bhaktapur"
+                        .to_owned(),
+                },
+                Field {
+                    label: "NICIN".to_owned(),
+                    value: "01".to_owned(),
+                },
+                Field {
+                    label: "CITIZENSHIP TYPE".to_owned(),
+                    value: "वंशज".to_owned(),
+                },
+                Field {
+                    label: "CITIZENSHIP NUMBER".to_owned(),
+                    value: "०४-०२-७३-०००१९".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn calls_the_pp_ocr_v5_service_contract() {
+        async fn mock(Json(request): Json<Value>) -> Json<Value> {
+            assert_eq!(request["file"], "dGVzdC1pbWFnZQ==");
+            assert_eq!(request["fileType"], 1);
+            assert_eq!(request["useDocOrientationClassify"], false);
+            assert_eq!(request["useTextlineOrientation"], true);
+            assert_eq!(request["textRecScoreThresh"], 0.45);
+            assert_eq!(request["visualize"], false);
+            Json(json!({
+                "logId": "test",
+                "errorCode": 0,
+                "errorMsg": "Success",
+                "result": {
+                    "ocrResults": [{
+                        "prunedResult": {
+                            "rec_texts": ["NAME", "Prayag", "noise"],
+                            "rec_scores": [0.99, 0.98, 0.1],
+                            "rec_polys": [
+                                [[10, 10], [110, 10], [110, 30], [10, 30]],
+                                [[10, 40], [110, 40], [110, 60], [10, 60]],
+                                [[10, 70], [110, 70], [110, 90], [10, 90]]
+                            ]
+                        },
+                        "ocrImage": null
+                    }],
+                    "dataInfo": {}
+                }
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock PP-OCRv5 service");
+        let endpoint = format!(
+            "http://{}/ocr",
+            listener.local_addr().expect("server address")
+        )
+        .parse()
+        .expect("valid mock URL");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/ocr", post(mock)))
+                .await
+                .expect("mock server failed");
+        });
+        let client = PaddleOcrClient::new(
+            endpoint,
+            None,
+            1,
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            0.45,
+        )
+        .expect("create PP-OCRv5 client");
+
+        let document = client
+            .extract(b"test-image")
+            .await
+            .expect("extract mocked document");
+        server.abort();
+
+        assert_eq!(
+            document.fields,
+            vec![Field {
+                label: "NAME".to_owned(),
+                value: "Prayag".to_owned(),
+            }]
+        );
+        assert_eq!(
+            serde_json::to_value(document).expect("serialize OCR response"),
+            json!({
+                "fields": [{
+                    "label": "NAME",
+                    "value": "Prayag"
+                }]
+            })
+        );
     }
 }

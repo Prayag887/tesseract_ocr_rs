@@ -1,17 +1,18 @@
 use std::sync::Arc;
 
-use axum::extract::{Multipart, Path, State};
 use axum::Json;
+use axum::extract::{Multipart, Path, State};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::ocr::{self, Field};
+use crate::ocr::{OcrDocument, PaddleOcrClient};
 use crate::scanner;
 
 pub struct AppState {
     pub output_dir: std::path::PathBuf,
     pub detector: scanner::DocDetector,
+    pub ocr: PaddleOcrClient,
 }
 
 #[derive(Serialize)]
@@ -77,7 +78,7 @@ pub async fn scan(
         scanner::scan_document(&state_for_scan.detector, &image_bytes)
     })
     .await
-    .expect("scan_document panicked")?;
+    .map_err(AppError::BlockingTask)??;
 
     let filename = format!("{id}.jpg");
     let path = state.output_dir.join(&filename);
@@ -108,9 +109,10 @@ pub async fn crop(
         .map_err(|_| AppError::NotFound)?;
 
     let corners = req.corners.map(|[x, y]| (x, y));
-    let output = tokio::task::spawn_blocking(move || scanner::crop_with_corners(&image_bytes, corners))
-        .await
-        .expect("crop_with_corners panicked")?;
+    let output =
+        tokio::task::spawn_blocking(move || scanner::crop_with_corners(&image_bytes, corners))
+            .await
+            .map_err(AppError::BlockingTask)??;
 
     let filename = format!("{id}.jpg");
     let path = state.output_dir.join(&filename);
@@ -128,17 +130,15 @@ pub async fn crop(
 pub async fn extract(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Vec<Field>>, AppError> {
+) -> Result<Json<OcrDocument>, AppError> {
     let path = state.output_dir.join(format!("{id}.jpg"));
-    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
-        return Err(AppError::NotFound);
-    }
-
-    // Shells out to the `tesseract` CLI; run on the blocking pool like the
-    // other CPU/process-bound work so it doesn't stall the async reactor.
-    let fields = tokio::task::spawn_blocking(move || ocr::extract_fields(&path))
+    let image = tokio::fs::read(&path)
         .await
-        .expect("extract_fields panicked")?;
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => AppError::NotFound,
+            _ => AppError::Io(error),
+        })?;
+    let document = state.ocr.extract(&image).await?;
 
-    Ok(Json(fields))
+    Ok(Json(document))
 }

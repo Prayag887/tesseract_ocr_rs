@@ -105,6 +105,8 @@ impl DocDetector {
 /// own center by [`CORNER_EXPAND_FRACTION`], clamped back to the image
 /// bounds, to compensate.
 const CORNER_EXPAND_FRACTION: f32 = 0.025;
+const MAX_CROP_DIMENSION: f64 = 16_384.0;
+const MIN_CROP_EDGE: f64 = 2.0;
 
 fn expand_quad(corners: [Point2f; 4], width: f32, height: f32) -> [Point2f; 4] {
     let cx = corners.iter().map(|p| p.x).sum::<f32>() / 4.0;
@@ -162,6 +164,7 @@ pub fn crop_with_corners(bytes: &[u8], corners: [(f32, f32); 4]) -> Result<ScanO
     let orig_size = original.size().map_err(AppError::Processing)?;
 
     let corners_full = corners.map(|(x, y)| Point2f::new(x, y));
+    validate_crop(&corners_full, orig_size.width, orig_size.height)?;
     let warped = warp_document(&original, &corners_full)?;
     let out_size = warped.size().map_err(AppError::Processing)?;
 
@@ -180,6 +183,50 @@ pub fn crop_with_corners(bytes: &[u8], corners: [(f32, f32); 4]) -> Result<ScanO
         orig_width: orig_size.width,
         orig_height: orig_size.height,
     })
+}
+
+fn validate_crop(
+    corners: &[Point2f; 4],
+    image_width: i32,
+    image_height: i32,
+) -> Result<(), AppError> {
+    let max_x = (image_width - 1) as f32;
+    let max_y = (image_height - 1) as f32;
+    if corners.iter().any(|point| {
+        !point.x.is_finite()
+            || !point.y.is_finite()
+            || point.x < 0.0
+            || point.y < 0.0
+            || point.x > max_x
+            || point.y > max_y
+    }) {
+        return Err(AppError::InvalidCrop(
+            "crop corners must be finite and inside the original image",
+        ));
+    }
+
+    let [tl, tr, br, bl] = *corners;
+    let width = dist(br, bl).max(dist(tr, tl));
+    let height = dist(tr, br).max(dist(tl, bl));
+    if width < MIN_CROP_EDGE || height < MIN_CROP_EDGE {
+        return Err(AppError::InvalidCrop("crop is too small"));
+    }
+    if width > MAX_CROP_DIMENSION || height > MAX_CROP_DIMENSION {
+        return Err(AppError::InvalidCrop("crop dimensions are too large"));
+    }
+
+    let twice_area = corners
+        .iter()
+        .zip(corners.iter().cycle().skip(1))
+        .take(corners.len())
+        .map(|(a, b)| a.x * b.y - b.x * a.y)
+        .sum::<f32>()
+        .abs();
+    if twice_area < 4.0 {
+        return Err(AppError::InvalidCrop("crop corners are degenerate"));
+    }
+
+    Ok(())
 }
 
 fn full_frame_corners(image: &Mat) -> Result<[Point2f; 4], AppError> {
@@ -246,4 +293,52 @@ fn warp_document(image: &Mat, corners: &[Point2f]) -> Result<Mat, AppError> {
     imgproc::warp_perspective_def(image, &mut warped, &transform, Size::new(width, height))?;
 
     Ok(warped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_a_valid_crop() {
+        let corners = [
+            Point2f::new(10.0, 10.0),
+            Point2f::new(90.0, 10.0),
+            Point2f::new(90.0, 90.0),
+            Point2f::new(10.0, 90.0),
+        ];
+
+        validate_crop(&corners, 100, 100).expect("valid crop");
+    }
+
+    #[test]
+    fn rejects_non_finite_and_out_of_bounds_crops() {
+        let non_finite = [
+            Point2f::new(f32::NAN, 10.0),
+            Point2f::new(90.0, 10.0),
+            Point2f::new(90.0, 90.0),
+            Point2f::new(10.0, 90.0),
+        ];
+        let out_of_bounds = [
+            Point2f::new(10.0, 10.0),
+            Point2f::new(100.0, 10.0),
+            Point2f::new(90.0, 90.0),
+            Point2f::new(10.0, 90.0),
+        ];
+
+        assert!(validate_crop(&non_finite, 100, 100).is_err());
+        assert!(validate_crop(&out_of_bounds, 100, 100).is_err());
+    }
+
+    #[test]
+    fn rejects_degenerate_crops() {
+        let corners = [
+            Point2f::new(10.0, 10.0),
+            Point2f::new(20.0, 20.0),
+            Point2f::new(30.0, 30.0),
+            Point2f::new(40.0, 40.0),
+        ];
+
+        assert!(validate_crop(&corners, 100, 100).is_err());
+    }
 }
