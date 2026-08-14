@@ -30,8 +30,8 @@ pub struct ScanOutput {
 /// are already in memory.
 pub struct DocDetector(Mutex<dnn::Net>);
 
-/// DocAligner's `fastvit_sa24` heatmap-regression model (Apache-2.0,
-/// github.com/DocsaidLab/DocAligner): a FastViT-SA24 backbone + BiFPN neck
+/// DocAligner's `lcnet100` heatmap-regression model (Apache-2.0,
+/// github.com/DocsaidLab/DocAligner): a PP-LCNet-1.0 backbone + BiFPN neck
 /// predicting one heatmap per corner rather than regressing point
 /// coordinates directly. DocAligner's own README documents why: a
 /// point-regression head trained at a fixed low resolution (256x256)
@@ -40,8 +40,13 @@ pub struct DocDetector(Mutex<dnn::Net>);
 /// whole neighborhood of source pixels collapses to one predicted pixel.
 /// A heatmap only has to say "the corner is roughly here", so upscaling
 /// its centroid to the original resolution doesn't carry that fixed
-/// pixel-error term — the accuracy gain this swap is for. Runs at the same
-/// fixed 256x256 input as the point model it replaces.
+/// pixel-error term. In practice, an A/B test against the original
+/// point-regression `lcnet050` and the much heavier `fastvit_sa24` variant
+/// found identical field-extraction accuracy across all three on a
+/// 105-image batch — so `lcnet100` was kept for being the same weight class
+/// as the original model with no measured downside, not for a proven
+/// accuracy win. Runs at the same fixed 256x256 input as the point model it
+/// replaces.
 const MODEL_PATH: &str = "models/docaligner_lcnet100.onnx";
 const MODEL_INPUT_SIZE: i32 = 256;
 /// Below this, a corner's heatmap is treated as empty (no document edge
@@ -77,6 +82,8 @@ impl DocDetector {
             opencv::core::CV_32F,
         )?;
 
+        let debug = std::env::var("SCAN_DEBUG_TIMING").is_ok();
+        let t_fwd = std::time::Instant::now();
         let mut net = self.0.lock().expect("dnn::Net mutex poisoned");
         net.set_input(&blob, "img", 1.0, Scalar::all(0.0))?;
 
@@ -84,6 +91,9 @@ impl DocDetector {
         let names = Vector::<String>::from_iter(["heatmap"]);
         net.forward(&mut outputs, &names)?;
         drop(net);
+        if debug {
+            eprintln!("[scan_timing]   detect/forward: {:?}", t_fwd.elapsed());
+        }
 
         // heatmap is [1, 4, H, W] — one channel per corner, in
         // [top-left, top-right, bottom-right, bottom-left] order (verified
@@ -93,6 +103,7 @@ impl DocDetector {
         let dims = heatmap.mat_size();
         let (map_h, map_w) = (dims[2], dims[3]);
 
+        let t_post = std::time::Instant::now();
         let mut corners = [Point2f::new(0.0, 0.0); 4];
         for (channel, corner) in corners.iter_mut().enumerate() {
             let Some(point) = largest_heatmap_blob_centroid(&heatmap, channel, map_h, map_w, orig_w, orig_h)?
@@ -100,6 +111,9 @@ impl DocDetector {
                 return Ok(None);
             };
             *corner = point;
+        }
+        if debug {
+            eprintln!("[scan_timing]   detect/heatmap_postprocess (x4): {:?}", t_post.elapsed());
         }
 
         let corners = expand_quad(order_corners(&corners), orig_w as f32, orig_h as f32);
@@ -208,26 +222,44 @@ fn expand_quad(corners: [Point2f; 4], width: f32, height: f32) -> [Point2f; 4] {
 }
 
 pub fn scan_document(detector: &DocDetector, bytes: &[u8]) -> Result<ScanOutput, AppError> {
+    let debug = std::env::var("SCAN_DEBUG_TIMING").is_ok();
+    let t0 = std::time::Instant::now();
     let buf = Vector::<u8>::from_slice(bytes);
     let original = imgcodecs::imdecode(&buf, imgcodecs::IMREAD_COLOR).map_err(AppError::Decode)?;
     if original.empty() {
         return Err(AppError::EmptyImage);
     }
     let orig_size = original.size().map_err(AppError::Processing)?;
+    if debug {
+        eprintln!("[scan_timing] decode: {:?} ({}x{})", t0.elapsed(), orig_size.width, orig_size.height);
+    }
 
+    let t1 = std::time::Instant::now();
     let (corners_full, corners_detected) = match detector.detect(&original)? {
         Some(corners) => (corners, true),
         None => (full_frame_corners(&original)?, false),
     };
+    if debug {
+        eprintln!("[scan_timing] detect: {:?}", t1.elapsed());
+    }
 
+    let t2 = std::time::Instant::now();
     let warped = warp_document(&original, &corners_full)?;
     let out_size = warped.size().map_err(AppError::Processing)?;
+    if debug {
+        eprintln!("[scan_timing] warp: {:?}", t2.elapsed());
+    }
 
+    let t3 = std::time::Instant::now();
     let mut params = Vector::<i32>::new();
     params.push(imgcodecs::IMWRITE_JPEG_QUALITY);
     params.push(92);
     let mut out_buf = Vector::<u8>::new();
     imgcodecs::imencode(".jpg", &warped, &mut out_buf, &params)?;
+    if debug {
+        eprintln!("[scan_timing] encode: {:?}", t3.elapsed());
+        eprintln!("[scan_timing] total: {:?}", t0.elapsed());
+    }
 
     Ok(ScanOutput {
         jpeg_bytes: out_buf.to_vec(),
