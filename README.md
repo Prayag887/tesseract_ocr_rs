@@ -10,7 +10,7 @@ module loading ONNX models directly. There is no service to start, no
 sidecar to keep alive, no model download step — the ONNX weights are
 committed in [`models/`](./models) and loaded at startup.
 
-## Run it
+## Run it like this:
 
 ```sh
 DYLD_FALLBACK_LIBRARY_PATH=/Library/Developer/CommandLineTools/usr/lib cargo run --release
