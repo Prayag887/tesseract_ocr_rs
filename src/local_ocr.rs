@@ -7,7 +7,7 @@ use opencv::prelude::*;
 use opencv::{dnn, geometry, imgcodecs, imgproc};
 
 use crate::error::AppError;
-use crate::ocr::{Field, OcrDocument, OcrLine, parse_fields, reading_order};
+use crate::ocr::{Field, OcrDocument, OcrLine, reading_order};
 
 const DET_MODEL_PATH: &str = "models/ppocrv5_det.onnx";
 const TEXTLINE_ORI_MODEL_PATH: &str = "models/textline_ori.onnx";
@@ -19,6 +19,15 @@ const NET_OUTPUT_NAME: &str = "fetch_name_0";
 
 // Mirrors OCR.yaml's active hyperparameters for PP-OCRv5_mobile_det, so the
 // native path produces the same boxes the Python PaddleX sidecar did.
+//
+// PP-OCRv6_medium_det was tried and reverted: on the real 105-image batch
+// it was 3x slower on average (1.29s -> 4.00s, max 13.69s — a much heavier
+// backbone, 62MB vs 4.8MB) and regressed DATE OF BIRTH extraction
+// (56 -> 32 cards). Recognition never changed in that experiment — PP-OCRv6
+// has no Devanagari-capable recognition model at all (only
+// PP-OCRv6_medium/small/tiny_rec, none script-tagged the way v5's
+// devanagari_/arabic_/cyrillic_ variants are), so it was detection-only and
+// still net negative.
 const DET_LIMIT_SIDE_LEN: i32 = 64;
 const DET_MAX_SIDE_LIMIT: i32 = 4000;
 const DET_THRESH: f64 = 0.3;
@@ -81,7 +90,11 @@ impl LocalOcrEngine {
         })
     }
 
-    pub async fn extract(&self, image: &[u8]) -> Result<OcrDocument, AppError> {
+    pub async fn extract(
+        &self,
+        image: &[u8],
+        llm: Option<&crate::llm_client::LlmVerifier>,
+    ) -> Result<OcrDocument, AppError> {
         let buf = Vector::<u8>::from_slice(image);
         let bgr = imgcodecs::imdecode(&buf, imgcodecs::IMREAD_COLOR).map_err(AppError::Decode)?;
         if bgr.empty() {
@@ -112,7 +125,7 @@ impl LocalOcrEngine {
                 tracing::info!("line {i}: {:?} conf={:.3}", line.text, line.confidence);
             }
         }
-        let fields: Vec<Field> = parse_fields(&lines);
+        let fields: Vec<Field> = crate::ocr::build_document(&lines, llm);
         Ok(OcrDocument { fields })
     }
 }

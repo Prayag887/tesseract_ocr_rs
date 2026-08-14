@@ -52,7 +52,7 @@ pub(crate) struct OcrLine {
     pub(crate) polygon: [[i32; 2]; 4],
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Field {
     pub label: String,
     pub value: String,
@@ -134,7 +134,11 @@ impl PaddleOcrClient {
         })
     }
 
-    pub async fn extract(&self, image: &[u8]) -> Result<OcrDocument, AppError> {
+    pub async fn extract(
+        &self,
+        image: &[u8],
+        llm: Option<&crate::llm_client::LlmVerifier>,
+    ) -> Result<OcrDocument, AppError> {
         let _permit = tokio::time::timeout(self.queue_timeout, self.permits.acquire())
             .await
             .map_err(|_| AppError::OcrQueueTimeout)?
@@ -211,7 +215,7 @@ impl PaddleOcrClient {
         }
 
         lines.sort_by(reading_order);
-        let fields = parse_fields(&lines);
+        let fields = build_document(&lines, llm);
 
         Ok(OcrDocument { fields })
     }
@@ -462,19 +466,60 @@ const CITIZENSHIP_CARD: DocumentType = DocumentType {
 
 const DOCUMENT_TYPES: &[DocumentType] = &[NATIONAL_IDENTITY_CARD, CITIZENSHIP_CARD];
 
-pub(crate) fn parse_fields(lines: &[OcrLine]) -> Vec<Field> {
-    let generic = parse_generic_fields(lines);
-    for document_type in DOCUMENT_TYPES {
+fn matched_document_type(lines: &[OcrLine]) -> Option<&'static DocumentType> {
+    DOCUMENT_TYPES.iter().find(|document_type| {
         let matches = document_type
             .detect_keywords
             .iter()
             .filter(|keyword| has_line_ci(lines, keyword))
             .count();
-        if matches >= document_type.min_detect_matches {
-            return extract_fields(lines, &generic, document_type.fields);
+        matches >= document_type.min_detect_matches
+    })
+}
+
+pub(crate) fn parse_fields(lines: &[OcrLine]) -> Vec<Field> {
+    let generic = parse_generic_fields(lines);
+    match matched_document_type(lines) {
+        Some(document_type) => extract_fields(lines, &generic, document_type.fields),
+        None => generic,
+    }
+}
+
+/// The output field labels expected for whatever document type `lines`
+/// scores as (NID, citizenship, ...), or `None` when nothing matched —
+/// letting a caller (the LLM verifier) fall back to open-ended label:value
+/// extraction instead of a fixed schema for document types with no table.
+pub(crate) fn expected_field_labels(lines: &[OcrLine]) -> Option<Vec<&'static str>> {
+    matched_document_type(lines).map(|document_type| {
+        document_type
+            .fields
+            .iter()
+            .map(|signature| signature.output_label)
+            .collect()
+    })
+}
+
+/// Builds the final field list for `lines`, preferring the LLM verifier
+/// (`crate::llm_client`) when one is configured: it reasons over each
+/// line's text *and* position, so it generalizes across label/value layouts
+/// ("Label: Value" inline vs. label-then-value-on-the-next-line) instead of
+/// needing a hand-coded case for each. Falls back to the deterministic
+/// keyword/shape rule engine — same behavior as `parse_fields` — if no
+/// verifier is configured, or if the sidecar call itself fails, so a crashed
+/// or slow LLM process degrades the response rather than losing it.
+pub(crate) fn build_document(lines: &[OcrLine], llm: Option<&crate::llm_client::LlmVerifier>) -> Vec<Field> {
+    let Some(llm) = llm else {
+        return parse_fields(lines);
+    };
+    let labels = expected_field_labels(lines);
+    let labels_ref = labels.as_deref();
+    match llm.extract(lines, labels_ref) {
+        Ok(fields) => fields,
+        Err(error) => {
+            tracing::warn!(%error, "llm_verifier failed, falling back to rule-based extraction");
+            parse_fields(lines)
         }
     }
-    generic
 }
 
 /// Runs every [`FieldSignature`] in `signatures` against `lines`, in order.
@@ -899,8 +944,12 @@ fn group_bounds(lines: &[OcrLine], indexes: &[usize]) -> Bounds {
     )
 }
 
-fn line_left(line: &OcrLine) -> i32 {
+pub(crate) fn line_left(line: &OcrLine) -> i32 {
     line.polygon.iter().map(|point| point[0]).min().unwrap_or(0)
+}
+
+pub(crate) fn line_top(line: &OcrLine) -> i32 {
+    line.polygon.iter().map(|point| point[1]).min().unwrap_or(0)
 }
 
 fn vertical_gap_from(label: Bounds, value: &OcrLine) -> i32 {
@@ -1429,7 +1478,7 @@ mod tests {
         .expect("create PP-OCRv5 client");
 
         let document = client
-            .extract(b"test-image")
+            .extract(b"test-image", None)
             .await
             .expect("extract mocked document");
         server.abort();

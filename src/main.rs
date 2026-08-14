@@ -1,4 +1,5 @@
 mod error;
+mod llm_client;
 mod local_ocr;
 mod ocr;
 mod routes;
@@ -36,10 +37,23 @@ async fn main() {
     };
     tracing::info!(backend = %ocr_backend, "OCR backend selected");
 
+    let llm = match std::env::var("FIELD_EXTRACTOR").as_deref() {
+        Ok("rules") => None,
+        _ => match llm_client::LlmVerifier::spawn() {
+            Ok(verifier) => Some(verifier),
+            Err(error) => {
+                tracing::warn!(%error, "failed to start llm_verifier sidecar, falling back to rule-based field extraction");
+                None
+            }
+        },
+    };
+    tracing::info!(field_extractor = if llm.is_some() { "llm" } else { "rules" }, "field extraction backend selected");
+
     let state = Arc::new(AppState {
         output_dir: output_dir.clone(),
         detector,
         ocr,
+        llm,
     });
 
     let app = Router::new()

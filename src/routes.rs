@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::llm_client::LlmVerifier;
 use crate::local_ocr::LocalOcrEngine;
 use crate::ocr::{OcrDocument, PaddleOcrClient};
 use crate::scanner;
@@ -19,10 +20,14 @@ pub enum OcrBackend {
 }
 
 impl OcrBackend {
-    pub async fn extract(&self, image: &[u8]) -> Result<OcrDocument, AppError> {
+    pub async fn extract(
+        &self,
+        image: &[u8],
+        llm: Option<&LlmVerifier>,
+    ) -> Result<OcrDocument, AppError> {
         match self {
-            OcrBackend::Local(engine) => engine.extract(image).await,
-            OcrBackend::Paddle(client) => client.extract(image).await,
+            OcrBackend::Local(engine) => engine.extract(image, llm).await,
+            OcrBackend::Paddle(client) => client.extract(image, llm).await,
         }
     }
 }
@@ -31,6 +36,7 @@ pub struct AppState {
     pub output_dir: std::path::PathBuf,
     pub detector: scanner::DocDetector,
     pub ocr: OcrBackend,
+    pub llm: Option<LlmVerifier>,
 }
 
 #[derive(Serialize)]
@@ -156,7 +162,7 @@ pub async fn extract(
             std::io::ErrorKind::NotFound => AppError::NotFound,
             _ => AppError::Io(error),
         })?;
-    let document = state.ocr.extract(&image).await?;
+    let document = state.ocr.extract(&image, state.llm.as_ref()).await?;
 
     Ok(Json(document))
 }
