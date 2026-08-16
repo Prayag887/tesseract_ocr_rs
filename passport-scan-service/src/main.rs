@@ -30,11 +30,18 @@ async fn main() {
 
     let detector = scanner::DocDetector::load().expect("failed to load document detection model");
     let ocr = local_ocr::MrzOcrEngine::load().expect("failed to load MRZ OCR models");
+    let max_concurrency = std::env::var("OCR_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(2)
+        .clamp(1, 64);
+    tracing::info!(max_concurrency, "image-processing concurrency configured");
 
     let state = Arc::new(AppState {
         output_dir: output_dir.clone(),
         detector,
         ocr,
+        processing_permits: tokio::sync::Semaphore::new(max_concurrency),
     });
 
     let app = Router::new()
@@ -66,8 +73,26 @@ async fn main() {
 }
 
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install Ctrl+C handler");
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
     tracing::info!("shutdown signal received");
 }

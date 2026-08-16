@@ -13,6 +13,7 @@ pub struct AppState {
     pub output_dir: std::path::PathBuf,
     pub detector: scanner::DocDetector,
     pub ocr: MrzOcrEngine,
+    pub processing_permits: tokio::sync::Semaphore,
 }
 
 #[derive(Serialize)]
@@ -66,6 +67,12 @@ pub async fn scan(
         .await
         .map_err(AppError::Io)?;
 
+    let _permit = state
+        .processing_permits
+        .acquire()
+        .await
+        .expect("processing semaphore is never closed");
+
     let state_for_scan = state.clone();
     let output = tokio::task::spawn_blocking(move || {
         scanner::scan_document(&state_for_scan.detector, &image_bytes)
@@ -102,6 +109,11 @@ pub async fn crop(
         .map_err(|_| AppError::NotFound)?;
 
     let corners = req.corners.map(|[x, y]| (x, y));
+    let _permit = state
+        .processing_permits
+        .acquire()
+        .await
+        .expect("processing semaphore is never closed");
     let output =
         tokio::task::spawn_blocking(move || scanner::crop_with_corners(&image_bytes, corners))
             .await
@@ -131,6 +143,11 @@ pub async fn extract(
             std::io::ErrorKind::NotFound => AppError::NotFound,
             _ => AppError::Io(error),
         })?;
+    let _permit = state
+        .processing_permits
+        .acquire()
+        .await
+        .expect("processing semaphore is never closed");
     let document = state.ocr.extract(&image).await?;
 
     Ok(Json(document))

@@ -36,11 +36,18 @@ async fn main() {
         other => panic!("invalid OCR_BACKEND {other:?}, expected \"local\" or \"paddlex\""),
     };
     tracing::info!(backend = %ocr_backend, "OCR backend selected");
+    let max_concurrency = std::env::var("OCR_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(2)
+        .clamp(1, 64);
+    tracing::info!(max_concurrency, "image-processing concurrency configured");
 
     let state = Arc::new(AppState {
         output_dir: output_dir.clone(),
         detector,
         ocr,
+        processing_permits: tokio::sync::Semaphore::new(max_concurrency),
     });
 
     let app = Router::new()
@@ -76,8 +83,26 @@ async fn main() {
 }
 
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install Ctrl+C handler");
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
     tracing::info!("shutdown signal received");
 }

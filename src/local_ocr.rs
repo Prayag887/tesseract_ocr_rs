@@ -40,6 +40,10 @@ const TEXTLINE_ORI_HEIGHT: i32 = 80;
 // "2003-01-24", etc.) before being wired in here.
 const REC_HEIGHT: i32 = 48;
 const REC_MAX_WIDTH: i32 = 2000;
+const DEFAULT_ORIENTATION_BATCH_SIZE: usize = 8;
+const DEFAULT_RECOGNITION_BATCH_SIZE: usize = 1;
+const MAX_BATCH_SIZE: usize = 64;
+const MAX_RECOGNITION_WORKERS: usize = 8;
 
 /// Native ONNX inference for PP-OCRv5, replacing the Python PaddleX sidecar
 /// (`PaddleOcrClient`) for latency: no HTTP round-trip, no Python process.
@@ -49,19 +53,19 @@ const REC_MAX_WIDTH: i32 = 2000;
 pub struct LocalOcrEngine {
     det: Mutex<dnn::Net>,
     textline_ori: Mutex<dnn::Net>,
-    rec: Mutex<dnn::Net>,
+    rec: Vec<Mutex<dnn::Net>>,
     /// index 0 = CTC blank, 1..=568 = `devanagari_rec_dict.txt`, 569 = space
     /// — the exact convention `inference.yml`'s `character_dict` encodes.
     rec_vocab: Vec<&'static str>,
     min_confidence: f32,
+    orientation_batch_size: usize,
+    recognition_batch_size: usize,
 }
 
 impl LocalOcrEngine {
     pub fn load() -> Result<Self, AppError> {
         let det = dnn::read_net_from_onnx_def(DET_MODEL_PATH)?;
         let textline_ori = dnn::read_net_from_onnx_def(TEXTLINE_ORI_MODEL_PATH)?;
-        let rec = dnn::read_net_from_onnx_def(REC_MODEL_PATH)?;
-
         let mut rec_vocab = Vec::with_capacity(570);
         rec_vocab.push(""); // CTC blank
         rec_vocab.extend(REC_DICT.lines());
@@ -71,13 +75,29 @@ impl LocalOcrEngine {
             .ok()
             .and_then(|value| value.parse::<f32>().ok())
             .unwrap_or(0.45);
+        let orientation_batch_size =
+            env_usize("OCR_ORIENTATION_BATCH_SIZE", DEFAULT_ORIENTATION_BATCH_SIZE)
+                .clamp(1, MAX_BATCH_SIZE);
+        let recognition_batch_size =
+            env_usize("OCR_RECOGNITION_BATCH_SIZE", DEFAULT_RECOGNITION_BATCH_SIZE)
+                .clamp(1, MAX_BATCH_SIZE);
+        let recognition_workers =
+            env_usize("OCR_RECOGNITION_WORKERS", default_recognition_workers())
+                .clamp(1, MAX_RECOGNITION_WORKERS);
+        let mut rec = Vec::with_capacity(recognition_workers);
+        for _ in 0..recognition_workers {
+            rec.push(Mutex::new(dnn::read_net_from_onnx_def(REC_MODEL_PATH)?));
+        }
+        tracing::info!(recognition_workers, "OCR recognition workers configured");
 
         Ok(Self {
             det: Mutex::new(det),
             textline_ori: Mutex::new(textline_ori),
-            rec: Mutex::new(rec),
+            rec,
             rec_vocab,
             min_confidence,
+            orientation_batch_size,
+            recognition_batch_size,
         })
     }
 
@@ -92,19 +112,54 @@ impl LocalOcrEngine {
     }
 
     fn extract_blocking(&self, image: &[u8]) -> Result<OcrDocument, AppError> {
+        let debug = std::env::var("OCR_DEBUG_TIMING").is_ok();
+        let t0 = std::time::Instant::now();
         let buf = Vector::<u8>::from_slice(image);
         let bgr = imgcodecs::imdecode(&buf, imgcodecs::IMREAD_COLOR).map_err(AppError::Decode)?;
         if bgr.empty() {
             return Err(AppError::EmptyImage);
         }
 
+        let t1 = std::time::Instant::now();
         let quads = detect_text_boxes(&self.det, &bgr)?;
+        if debug {
+            eprintln!(
+                "[ocr_timing] detect_text_boxes: {:?} ({} boxes)",
+                t1.elapsed(),
+                quads.len()
+            );
+        }
+
+        let t2 = std::time::Instant::now();
+        let mut crops = Vec::with_capacity(quads.len());
+        for quad in &quads {
+            crops.push(crop_quad(&bgr, quad)?);
+        }
+        let crops = classify_and_fix_rotation_batch(
+            &self.textline_ori,
+            crops,
+            self.orientation_batch_size,
+        )?;
+        if debug {
+            eprintln!(
+                "[ocr_timing] crop + batched orientation: {:?}",
+                t2.elapsed()
+            );
+        }
+
+        let t3 = std::time::Instant::now();
+        let recognized = recognize_lines_parallel(
+            &self.rec,
+            &self.rec_vocab,
+            &crops,
+            self.recognition_batch_size,
+        )?;
+        if debug {
+            eprintln!("[ocr_timing] batched recognition: {:?}", t3.elapsed());
+        }
 
         let mut lines = Vec::with_capacity(quads.len());
-        for quad in quads {
-            let crop = crop_quad(&bgr, &quad)?;
-            let crop = classify_and_fix_rotation(&self.textline_ori, crop)?;
-            let (text, confidence) = recognize_line(&self.rec, &self.rec_vocab, &crop)?;
+        for (quad, (text, confidence)) in quads.into_iter().zip(recognized) {
             let text = text.trim();
             if text.is_empty() || confidence < self.min_confidence {
                 continue;
@@ -123,8 +178,28 @@ impl LocalOcrEngine {
             }
         }
         let fields: Vec<Field> = parse_fields(&lines);
+        if debug {
+            eprintln!("[ocr_timing] total: {:?}", t0.elapsed());
+        }
         Ok(OcrDocument { fields })
     }
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn default_recognition_workers() -> usize {
+    let logical_cpus = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    let request_concurrency = env_usize("OCR_MAX_CONCURRENCY", 2).clamp(1, 64);
+    logical_cpus
+        .div_ceil(request_concurrency)
+        .clamp(1, MAX_RECOGNITION_WORKERS)
 }
 
 fn forward(net: &Mutex<dnn::Net>, blob: &Mat) -> Result<Mat, AppError> {
@@ -154,24 +229,6 @@ fn imagenet_nchw(rgb: &Mat) -> Result<Vec<f32>, AppError> {
         for channel in 0..3 {
             let value = f32::from(pixel[channel]) / 255.0;
             out[channel * plane + index] = (value - IMAGENET_MEAN[channel]) / IMAGENET_STD[channel];
-        }
-    }
-    Ok(out)
-}
-
-/// Same packing as [`imagenet_nchw`] but for the recognition model's own
-/// normalization, `(pixel - 127.5) / 127.5` — PaddleOCR's standard CTC
-/// recognizer preprocessing, verified against real recognized text.
-fn rec_nchw(rgb: &Mat) -> Result<Vec<f32>, AppError> {
-    let rows = rgb.rows();
-    let cols = rgb.cols();
-    let pixels = rgb.data_typed::<Vec3b>()?;
-    let plane = (rows * cols) as usize;
-    let mut out = vec![0f32; 3 * plane];
-    for (index, pixel) in pixels.iter().enumerate() {
-        for channel in 0..3 {
-            let value = f32::from(pixel[channel]);
-            out[channel * plane + index] = (value - 127.5) / 127.5;
         }
     }
     Ok(out)
@@ -326,17 +383,17 @@ fn box_score(prob_2d: &Mat, rect: RotatedRect, map_w: i32, map_h: i32) -> Result
     rect.points(&mut quad_points)?;
     let local_points: Vector<Point> = quad_points
         .iter()
-        .map(|p| Point::new((p.x - x0 as f32).round() as i32, (p.y - y0 as f32).round() as i32))
+        .map(|p| {
+            Point::new(
+                (p.x - x0 as f32).round() as i32,
+                (p.y - y0 as f32).round() as i32,
+            )
+        })
         .collect();
     let mut contour_group = Vector::<Vector<Point>>::new();
     contour_group.push(local_points);
 
-    let mut mask = Mat::new_rows_cols_with_default(
-        y1 - y0,
-        x1 - x0,
-        CV_8U,
-        Scalar::all(0.0),
-    )?;
+    let mut mask = Mat::new_rows_cols_with_default(y1 - y0, x1 - x0, CV_8U, Scalar::all(0.0))?;
     imgproc::fill_poly_def(&mut mask, &contour_group, Scalar::all(1.0))?;
 
     let mean = opencv::core::mean(&roi, &mask)?;
@@ -420,83 +477,161 @@ fn crop_quad(image: &Mat, corners: &[Point2f; 4]) -> Result<Mat, AppError> {
 /// known-rotated ground-truth line, since every line on the real test scan
 /// was already upright. Low risk: on a misclassification the crop is used
 /// as-is, same as if this step didn't run at all.
-fn classify_and_fix_rotation(textline_ori: &Mutex<dnn::Net>, crop: Mat) -> Result<Mat, AppError> {
-    let size = crop.size()?;
-    if size.width < 1 || size.height < 1 {
-        return Ok(crop);
-    }
+fn classify_and_fix_rotation_batch(
+    textline_ori: &Mutex<dnn::Net>,
+    mut crops: Vec<Mat>,
+    batch_size: usize,
+) -> Result<Vec<Mat>, AppError> {
+    for chunk in crops.chunks_mut(batch_size) {
+        let sample_len = (3 * TEXTLINE_ORI_HEIGHT * TEXTLINE_ORI_WIDTH) as usize;
+        let mut data = Vec::with_capacity(chunk.len() * sample_len);
+        for crop in chunk.iter() {
+            let mut resized = Mat::default();
+            imgproc::resize(
+                crop,
+                &mut resized,
+                Size::new(TEXTLINE_ORI_WIDTH, TEXTLINE_ORI_HEIGHT),
+                0.0,
+                0.0,
+                imgproc::INTER_LINEAR,
+            )?;
+            let mut rgb = Mat::default();
+            imgproc::cvt_color_def(&resized, &mut rgb, imgproc::COLOR_BGR2RGB)?;
+            data.extend(imagenet_nchw(&rgb)?);
+        }
+        let blob = nchw_blob(
+            &[
+                chunk.len() as i32,
+                3,
+                TEXTLINE_ORI_HEIGHT,
+                TEXTLINE_ORI_WIDTH,
+            ],
+            &data,
+        )?;
+        let out = forward(textline_ori, &blob)?;
 
-    let mut resized = Mat::default();
-    imgproc::resize(
-        &crop,
-        &mut resized,
-        Size::new(TEXTLINE_ORI_WIDTH, TEXTLINE_ORI_HEIGHT),
-        0.0,
-        0.0,
-        imgproc::INTER_LINEAR,
-    )?;
-    let mut rgb = Mat::default();
-    imgproc::cvt_color_def(&resized, &mut rgb, imgproc::COLOR_BGR2RGB)?;
-    let data = imagenet_nchw(&rgb)?;
-    let blob = nchw_blob(&[1, 3, TEXTLINE_ORI_HEIGHT, TEXTLINE_ORI_WIDTH], &data)?;
-    let out = forward(textline_ori, &blob)?;
-
-    let upright: f32 = *out.at_2d(0, 0)?;
-    let flipped: f32 = *out.at_2d(0, 1)?;
-    if flipped > upright {
-        let mut rotated = Mat::default();
-        opencv::core::flip(&crop, &mut rotated, -1)?;
-        Ok(rotated)
-    } else {
-        Ok(crop)
+        for (index, crop) in chunk.iter_mut().enumerate() {
+            let upright: f32 = *out.at_2d(index as i32, 0)?;
+            let flipped: f32 = *out.at_2d(index as i32, 1)?;
+            if flipped > upright {
+                let mut rotated = Mat::default();
+                opencv::core::flip(crop, &mut rotated, -1)?;
+                *crop = rotated;
+            }
+        }
     }
+    Ok(crops)
 }
 
-/// Resizes the crop to the recognizer's fixed height (preserving aspect
-/// ratio) and greedy-CTC-decodes its output: argmax per timestep, collapse
-/// repeats, drop the blank index. Preprocessing and decode both verified
-/// against real recognized text ("ROSHAN JOSHI", "DATE OF BIRTH", "SEX",
-/// "M", "2003-01-24") before being wired in here.
-fn recognize_line(
+fn recognize_lines_parallel(
+    recognizers: &[Mutex<dnn::Net>],
+    vocab: &[&str],
+    crops: &[Mat],
+    batch_size: usize,
+) -> Result<Vec<(String, f32)>, AppError> {
+    if recognizers.len() == 1 || crops.len() <= 1 {
+        return recognize_lines_batch(&recognizers[0], vocab, crops, batch_size);
+    }
+
+    let worker_count = recognizers.len().min(crops.len());
+    let chunk_size = crops.len().div_ceil(worker_count);
+    let mut recognized = Vec::with_capacity(crops.len());
+    std::thread::scope(|scope| -> Result<(), AppError> {
+        let mut handles = Vec::with_capacity(worker_count);
+        for (recognizer, chunk) in recognizers.iter().zip(crops.chunks(chunk_size)) {
+            handles.push(
+                scope.spawn(move || recognize_lines_batch(recognizer, vocab, chunk, batch_size)),
+            );
+        }
+        for handle in handles {
+            recognized.extend(handle.join().map_err(|_| AppError::OcrWorkerPanicked)??);
+        }
+        Ok(())
+    })?;
+    Ok(recognized)
+}
+
+fn recognize_lines_batch(
     rec: &Mutex<dnn::Net>,
     vocab: &[&str],
-    crop: &Mat,
-) -> Result<(String, f32), AppError> {
-    let size = crop.size()?;
-    if size.width < 1 || size.height < 1 {
-        return Ok((String::new(), 0.0));
+    crops: &[Mat],
+    batch_size: usize,
+) -> Result<Vec<(String, f32)>, AppError> {
+    let mut widths = Vec::with_capacity(crops.len());
+    for (index, crop) in crops.iter().enumerate() {
+        let size = crop.size()?;
+        let width = ((f64::from(size.width) * f64::from(REC_HEIGHT)
+            / f64::from(size.height.max(1)))
+        .round() as i32)
+            .clamp(1, REC_MAX_WIDTH);
+        widths.push((index, width));
     }
-    let new_w = ((f64::from(size.width) * f64::from(REC_HEIGHT) / f64::from(size.height)).round()
-        as i32)
-        .clamp(1, REC_MAX_WIDTH);
+    widths.sort_unstable_by_key(|&(_, width)| width);
+    let mut recognized = vec![(String::new(), 0.0); crops.len()];
+    let mut start = 0;
+    while start < widths.len() {
+        let mut end = (start + batch_size).min(widths.len());
+        while end > start + 1 && widths[end - 1].1 > widths[start].1.saturating_mul(2) {
+            end -= 1;
+        }
+        let group = &widths[start..end];
+        let padded_width = group.last().expect("non-empty recognition batch").1;
+        let plane = (REC_HEIGHT * padded_width) as usize;
+        let mut data = vec![0.0_f32; group.len() * 3 * plane];
+        for (batch_index, &(crop_index, width)) in group.iter().enumerate() {
+            let mut resized = Mat::default();
+            imgproc::resize(
+                &crops[crop_index],
+                &mut resized,
+                Size::new(width, REC_HEIGHT),
+                0.0,
+                0.0,
+                imgproc::INTER_LINEAR,
+            )?;
+            let mut rgb = Mat::default();
+            imgproc::cvt_color_def(&resized, &mut rgb, imgproc::COLOR_BGR2RGB)?;
+            let pixels = rgb.data_typed::<Vec3b>()?;
+            let batch_base = batch_index * 3 * plane;
+            for (pixel_index, pixel) in pixels.iter().enumerate() {
+                let y = pixel_index / width as usize;
+                let x = pixel_index % width as usize;
+                for channel in 0..3 {
+                    data[batch_base + channel * plane + y * padded_width as usize + x] =
+                        (f32::from(pixel[channel]) - 127.5) / 127.5;
+                }
+            }
+        }
+        let blob = nchw_blob(&[group.len() as i32, 3, REC_HEIGHT, padded_width], &data)?;
+        let out = forward(rec, &blob)?;
+        for (batch_index, &(crop_index, width)) in group.iter().enumerate() {
+            recognized[crop_index] =
+                decode_recognition(&out, batch_index as i32, width, padded_width, vocab)?;
+        }
+        start = end;
+    }
+    Ok(recognized)
+}
 
-    let mut resized = Mat::default();
-    imgproc::resize(
-        crop,
-        &mut resized,
-        Size::new(new_w, REC_HEIGHT),
-        0.0,
-        0.0,
-        imgproc::INTER_LINEAR,
-    )?;
-    let mut rgb = Mat::default();
-    imgproc::cvt_color_def(&resized, &mut rgb, imgproc::COLOR_BGR2RGB)?;
-    let data = rec_nchw(&rgb)?;
-    let blob = nchw_blob(&[1, 3, REC_HEIGHT, new_w], &data)?;
-    let out = forward(rec, &blob)?;
-
+fn decode_recognition(
+    out: &Mat,
+    batch_index: i32,
+    valid_width: i32,
+    padded_width: i32,
+    vocab: &[&str],
+) -> Result<(String, f32), AppError> {
     let dims = out.mat_size();
-    let timesteps = dims[1];
+    let timesteps = ((dims[1] * valid_width + padded_width - 1) / padded_width).clamp(1, dims[1]);
     let vocab_len = dims[2];
 
     let mut text = String::new();
-    let mut confidences = Vec::new();
+    let mut confidence_sum = 0.0_f32;
+    let mut confidence_count = 0_usize;
     let mut previous_index = -1_i32;
     for t in 0..timesteps {
         let mut best_index = 0_i32;
         let mut best_value = f32::MIN;
         for v in 0..vocab_len {
-            let value: f32 = *out.at_3d(0, t, v)?;
+            let value: f32 = *out.at_3d(batch_index, t, v)?;
             if value > best_value {
                 best_value = value;
                 best_index = v;
@@ -507,15 +642,16 @@ fn recognize_line(
             && let Some(character) = vocab.get(best_index as usize)
         {
             text.push_str(character);
-            confidences.push(best_value);
+            confidence_sum += best_value;
+            confidence_count += 1;
         }
         previous_index = best_index;
     }
 
-    let confidence = if confidences.is_empty() {
+    let confidence = if confidence_count == 0 {
         0.0
     } else {
-        confidences.iter().sum::<f32>() / confidences.len() as f32
+        confidence_sum / confidence_count as f32
     };
     Ok((text, confidence))
 }

@@ -55,6 +55,10 @@ is still in the codebase as a rollback path, selected via `OCR_BACKEND`:
 |---|---:|---|
 | `OCR_BACKEND` | `local` | `local` (native ONNX) or `paddlex` (legacy HTTP sidecar). |
 | `PADDLE_OCR_MIN_CONFIDENCE` | `0.45` | Recognition confidence threshold below which a line is dropped. |
+| `OCR_ORIENTATION_BATCH_SIZE` | `8` | Number of fixed-size text-line orientation inputs inferred together. |
+| `OCR_RECOGNITION_BATCH_SIZE` | `1` | Recognition batch size. Keep at `1` unless the deployment backend and document corpus have been accuracy-tested at a larger value. |
+| `OCR_RECOGNITION_WORKERS` | automatic | Independent recognition models used to process text lines concurrently. Defaults to logical CPUs divided by `OCR_MAX_CONCURRENCY`, capped at `8`; set explicitly to tune memory/latency for a deployment CPU. |
+| `OCR_MAX_CONCURRENCY` | `2` | Maximum simultaneous scan, crop, or OCR jobs per service process; excess requests wait without occupying more inference capacity. |
 | `OCR_DEBUG_LINES` | unset | If set, logs every recognized OCR line (text + confidence) at INFO level — useful for diagnosing missing/wrong fields. |
 
 ## Checks

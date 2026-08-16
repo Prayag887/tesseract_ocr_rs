@@ -106,14 +106,18 @@ impl DocDetector {
         let t_post = std::time::Instant::now();
         let mut corners = [Point2f::new(0.0, 0.0); 4];
         for (channel, corner) in corners.iter_mut().enumerate() {
-            let Some(point) = largest_heatmap_blob_centroid(&heatmap, channel, map_h, map_w, orig_w, orig_h)?
+            let Some(point) =
+                largest_heatmap_blob_centroid(&heatmap, channel, map_h, map_w, orig_w, orig_h)?
             else {
                 return Ok(None);
             };
             *corner = point;
         }
         if debug {
-            eprintln!("[scan_timing]   detect/heatmap_postprocess (x4): {:?}", t_post.elapsed());
+            eprintln!(
+                "[scan_timing]   detect/heatmap_postprocess (x4): {:?}",
+                t_post.elapsed()
+            );
         }
 
         let corners = expand_quad(order_corners(&corners), orig_w as f32, orig_h as f32);
@@ -231,7 +235,12 @@ pub fn scan_document(detector: &DocDetector, bytes: &[u8]) -> Result<ScanOutput,
     }
     let orig_size = original.size().map_err(AppError::Processing)?;
     if debug {
-        eprintln!("[scan_timing] decode: {:?} ({}x{})", t0.elapsed(), orig_size.width, orig_size.height);
+        eprintln!(
+            "[scan_timing] decode: {:?} ({}x{})",
+            t0.elapsed(),
+            orig_size.width,
+            orig_size.height
+        );
     }
 
     let t1 = std::time::Instant::now();
@@ -395,8 +404,11 @@ fn dist(a: Point2f, b: Point2f) -> f64 {
 fn warp_document(image: &Mat, corners: &[Point2f]) -> Result<Mat, AppError> {
     let [tl, tr, br, bl] = [corners[0], corners[1], corners[2], corners[3]];
 
-    let width = dist(br, bl).max(dist(tr, tl)).round() as i32;
-    let height = dist(tr, br).max(dist(tl, bl)).round() as i32;
+    // Corner coordinates address pixel centers and are inclusive. A full-width
+    // edge from x=0 through x=2159 therefore contains 2160 pixels even though
+    // the Euclidean distance between the endpoint centers is 2159.
+    let width = dist(br, bl).max(dist(tr, tl)).round() as i32 + 1;
+    let height = dist(tr, br).max(dist(tl, bl)).round() as i32 + 1;
     let width = width.max(1);
     let height = height.max(1);
 
@@ -461,5 +473,18 @@ mod tests {
         ];
 
         assert!(validate_crop(&corners, 100, 100).is_err());
+    }
+
+    #[test]
+    fn full_frame_warp_preserves_original_pixel_dimensions() {
+        let image =
+            Mat::new_rows_cols_with_default(80, 120, opencv::core::CV_8UC3, Scalar::all(0.0))
+                .expect("test image");
+        let corners = full_frame_corners(&image).expect("full-frame corners");
+
+        let warped = warp_document(&image, &corners).expect("full-frame warp");
+
+        assert_eq!(warped.cols(), 120);
+        assert_eq!(warped.rows(), 80);
     }
 }

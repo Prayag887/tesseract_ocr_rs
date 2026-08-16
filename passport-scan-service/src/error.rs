@@ -23,6 +23,8 @@ pub enum AppError {
     Multipart(#[from] axum::extract::multipart::MultipartError),
     #[error("blocking image task failed: {0}")]
     BlockingTask(#[source] tokio::task::JoinError),
+    #[error("OCR recognition worker panicked")]
+    OcrWorkerPanicked,
     #[error("MRZ not found or unreadable on this document")]
     MrzNotFound,
     #[error("MRZ checksum validation failed: {0}")]
@@ -46,9 +48,10 @@ impl IntoResponse for AppError {
             | AppError::MrzChecksum(_) => StatusCode::BAD_REQUEST,
             AppError::NotFound => StatusCode::NOT_FOUND,
             AppError::Multipart(_) => StatusCode::BAD_REQUEST,
-            AppError::Processing(_) | AppError::Io(_) | AppError::BlockingTask(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            AppError::Processing(_)
+            | AppError::Io(_)
+            | AppError::BlockingTask(_)
+            | AppError::OcrWorkerPanicked => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let message = match &self {
             AppError::MissingImage => "no image field found in multipart body",
@@ -59,9 +62,10 @@ impl IntoResponse for AppError {
             AppError::Multipart(_) => "invalid multipart upload",
             AppError::MrzNotFound => "MRZ not found or unreadable on this document",
             AppError::MrzChecksum(message) => message,
-            AppError::Processing(_) | AppError::Io(_) | AppError::BlockingTask(_) => {
-                "internal server error"
-            }
+            AppError::Processing(_)
+            | AppError::Io(_)
+            | AppError::BlockingTask(_)
+            | AppError::OcrWorkerPanicked => "internal server error",
         };
         if status.is_server_error() {
             tracing::error!(error = ?self, "request failed");

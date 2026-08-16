@@ -37,6 +37,8 @@ pub enum AppError {
     OcrInputTooLarge,
     #[error("blocking image task failed: {0}")]
     BlockingTask(#[source] tokio::task::JoinError),
+    #[error("OCR recognition worker panicked")]
+    OcrWorkerPanicked,
 }
 
 impl From<opencv::Error> for AppError {
@@ -64,7 +66,8 @@ impl IntoResponse for AppError {
             | AppError::OcrConfig(_)
             | AppError::OcrUnavailable
             | AppError::OcrInputTooLarge
-            | AppError::BlockingTask(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            | AppError::BlockingTask(_)
+            | AppError::OcrWorkerPanicked => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let message = match &self {
             AppError::MissingImage => "no image field found in multipart body",
@@ -83,7 +86,8 @@ impl IntoResponse for AppError {
             | AppError::Io(_)
             | AppError::OcrConfig(_)
             | AppError::OcrInputTooLarge
-            | AppError::BlockingTask(_) => "internal server error",
+            | AppError::BlockingTask(_)
+            | AppError::OcrWorkerPanicked => "internal server error",
         };
         if status.is_server_error() {
             tracing::error!(error = ?self, "request failed");
