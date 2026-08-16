@@ -24,11 +24,15 @@ jobs:
           gcc --version
           g++ --version
 
-      - name: Install system deps
+      - name: Install build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libopencv-dev clang libclang-dev pkg-config build-essential
+            cmake ninja-build git pkg-config \
+            clang libclang-dev llvm-dev \
+            libjpeg62-turbo-dev libpng-dev libtiff-dev libwebp-dev libopenexr-dev \
+            libavcodec-dev libavformat-dev libswscale-dev libavutil-dev \
+            zlib1g-dev
 
       - name: Locate libclang
         run: |
@@ -38,6 +42,39 @@ jobs:
           libdir="$(dirname "$found")"
           echo "LIBCLANG_PATH=$libdir" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$libdir:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+
+      # Ubuntu's own libopencv-dev is 4.6 - this project needs OpenCV 5's
+      # `geometry` module, so it's built from source here, matching the
+      # Dockerfile exactly (same version, same trimmed module set).
+      - name: Cache OpenCV 5 build
+        id: opencv-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/local
+          key: opencv5-${{ runner.os }}-v1
+
+      - name: Build & install OpenCV 5
+        if: steps.opencv-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --branch 5.0.0 --depth 1 https://github.com/opencv/opencv.git /tmp/opencv-src
+          cmake -S /tmp/opencv-src -B /tmp/opencv-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DOPENCV_GENERATE_PKGCONFIG=ON \
+            -DBUILD_SHARED_LIBS=ON \
+            -DBUILD_opencv_python2=OFF -DBUILD_opencv_python3=OFF \
+            -DBUILD_JAVA=OFF -DBUILD_opencv_apps=OFF \
+            -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_DOCS=OFF \
+            -DWITH_CUDA=OFF -DWITH_CUDNN=OFF -DWITH_OPENCL=OFF -DWITH_IPP=OFF -DWITH_ITT=OFF
+          cmake --build /tmp/opencv-build -j"$(nproc)"
+          sudo cmake --install /tmp/opencv-build
+
+      - name: ldconfig
+        run: sudo ldconfig
+
+      - name: Set OpenCV pkg-config path
+        run: |
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib64/pkgconfig" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
 
