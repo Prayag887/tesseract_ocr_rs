@@ -7,7 +7,7 @@ edition = "2024"
 opencv = { version = "0.100", default-features = false, features = ["imgproc", "imgcodecs", "geometry", "dnn"] }
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "sync", "time"] }
-tower-http = { version = "0.6", features = ["trace", "limit", "fs"] }
+tower-http = { version = "0.6", features = ["trace", "limit", "fs", "cors"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
+use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
@@ -51,11 +52,21 @@ async fn main() {
         .fallback_service(ServeDir::new("static"))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(TraceLayer::new_for_http())
+        // Permissive: the shared UI switches tabs between this service
+        // (port 3002) and passport-scan-service (port 3003) via absolute
+        // fetch URLs, so both need to answer cross-origin. Both are
+        // internal, unauthenticated local-dev services already — tighten
+        // this to an explicit origin allowlist before any public exposure.
+        .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3000);
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
-        .expect("failed to bind to 0.0.0.0:3000");
+        .expect("failed to bind");
     tracing::info!("listening on {}", listener.local_addr().unwrap());
 
     axum::serve(listener, app)

@@ -1,0 +1,9 @@
+target
+.venv_paddleocr
+scanned_document/*.jpg
+tessdata
+llm_verifier
+passport-scan-service
+.git
+.idea
+*.log

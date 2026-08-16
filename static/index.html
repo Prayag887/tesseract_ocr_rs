@@ -81,6 +81,29 @@
     font-weight: 750;
   }
 
+  .tabs {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 22px;
+    padding: 4px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--panel-soft);
+    width: fit-content;
+  }
+
+  .tab {
+    border-radius: 9px;
+    padding: 9px 16px;
+    background: transparent;
+    color: var(--muted);
+    font-weight: 700;
+  }
+
+  .tab:hover:not(:disabled) { background: #eceff5; color: var(--text); transform: none; }
+  .tab.active { background: var(--panel); color: var(--primary); box-shadow: var(--shadow); }
+  .tab.active:hover { background: var(--panel); }
+
   .upload-card {
     padding: 10px;
     border: 1px solid var(--line);
@@ -300,9 +323,15 @@
     <div>
       <p class="eyebrow">Document extraction</p>
       <h1>Turn an image into clean JSON.</h1>
-      <p class="subtitle">Upload a document, confirm the crop, and receive only structured label and value pairs.</p>
+      <p class="subtitle" id="subtitle">Upload a document, confirm the crop, and receive only structured label and value pairs.</p>
     </div>
+    <span id="modelBadge" class="model-badge">PP-OCRv5 · Devanagari</span>
   </header>
+
+  <div class="tabs" role="tablist" aria-label="Document type">
+    <button type="button" class="tab active" id="tabNid" role="tab" aria-selected="true">National ID</button>
+    <button type="button" class="tab" id="tabPassport" role="tab" aria-selected="false">Passport (MRZ)</button>
+  </div>
 
   <section class="upload-card" aria-label="Upload document">
     <div id="drop" tabindex="0" role="button" aria-label="Choose or drop an image">
@@ -380,6 +409,33 @@ const fieldsStatusEl = document.getElementById('fieldsStatus');
 const fieldsEl = document.getElementById('fields');
 const fieldCountEl = document.getElementById('fieldCount');
 const copyBtn = document.getElementById('copyBtn');
+const tabNid = document.getElementById('tabNid');
+const tabPassport = document.getElementById('tabPassport');
+const subtitleEl = document.getElementById('subtitle');
+const modelBadgeEl = document.getElementById('modelBadge');
+
+// Two independent microservices (NID: Devanagari label/value parsing;
+// Passport: MRZ fixed-column + checksum decode) with no shared runtime —
+// only the frontend is shared, switching which origin it talks to.
+const SERVICES = {
+  nid: {
+    base: 'http://localhost:3002',
+    badge: 'PP-OCRv5 · Devanagari',
+    subtitle: 'Upload a Nepali national ID or citizenship card, confirm the crop, and receive structured label and value pairs.',
+    extractingMessage: 'Reading label and value pairs with PP-OCRv5…',
+  },
+  passport: {
+    base: 'http://localhost:3003',
+    badge: 'PP-OCRv5 · MRZ',
+    subtitle: 'Upload a passport photo page, confirm the crop, and receive the decoded, checksum-verified MRZ.',
+    extractingMessage: 'Reading the machine-readable zone with PP-OCRv5…',
+  },
+};
+let activeKey = 'nid';
+
+function apiBase() {
+  return SERVICES[activeKey].base;
+}
 
 let currentFile = null;
 let scanId = null;
@@ -387,6 +443,40 @@ let detectedCorners = null;
 let corners = null;
 let originalObjectUrl = null;
 let extractionController = null;
+
+function selectTab(key) {
+  if (key === activeKey) return;
+  extractionController?.abort();
+  extractionController = null;
+  activeKey = key;
+
+  tabNid.classList.toggle('active', key === 'nid');
+  tabNid.setAttribute('aria-selected', String(key === 'nid'));
+  tabPassport.classList.toggle('active', key === 'passport');
+  tabPassport.setAttribute('aria-selected', String(key === 'passport'));
+  subtitleEl.textContent = SERVICES[key].subtitle;
+  modelBadgeEl.textContent = SERVICES[key].badge;
+
+  // Switching document type starts a fresh session — a scan id from one
+  // service means nothing to the other.
+  currentFile = null;
+  scanId = null;
+  detectedCorners = null;
+  corners = null;
+  if (originalObjectUrl) {
+    URL.revokeObjectURL(originalObjectUrl);
+    originalObjectUrl = null;
+  }
+  fileInput.value = '';
+  fileNameEl.textContent = 'No image selected';
+  workspace.hidden = true;
+  scanBtn.disabled = true;
+  setStatus('');
+  setError('');
+}
+
+tabNid.addEventListener('click', () => selectTab('nid'));
+tabPassport.addEventListener('click', () => selectTab('passport'));
 
 drop.addEventListener('click', () => fileInput.click());
 drop.addEventListener('keydown', (event) => {
@@ -481,7 +571,7 @@ scanBtn.addEventListener('click', async () => {
   form.append('image', currentFile);
 
   try {
-    const response = await fetch('/scan', { method: 'POST', body: form });
+    const response = await fetch(`${apiBase()}/scan`, { method: 'POST', body: form });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
 
@@ -507,31 +597,40 @@ scanBtn.addEventListener('click', async () => {
   }
 });
 
+function renderExtraction(data) {
+  fieldsEl.textContent = JSON.stringify(data, null, 2);
+  fieldsEl.hidden = false;
+  fieldsStatusEl.hidden = true;
+  if (activeKey === 'nid') {
+    if (!Array.isArray(data.fields)) throw new Error('Invalid extraction response');
+    fieldCountEl.textContent = `${data.fields.length} ${data.fields.length === 1 ? 'field' : 'fields'} found`;
+  } else {
+    fieldCountEl.textContent = data.composite_check_ok ? 'MRZ checksum valid' : 'MRZ checksum FAILED';
+  }
+  copyBtn.disabled = false;
+}
+
 async function runExtraction() {
   if (!scanId) return;
   extractionController?.abort();
   const controller = new AbortController();
   const extractingId = scanId;
+  const extractingKey = activeKey;
   extractionController = controller;
   fieldsEl.hidden = true;
   fieldsStatusEl.hidden = false;
-  fieldsStatusEl.textContent = 'Reading label and value pairs with PP-OCRv5…';
+  fieldsStatusEl.textContent = SERVICES[activeKey].extractingMessage;
 
   try {
-    const response = await fetch(`/extract/${extractingId}`, {
+    const response = await fetch(`${SERVICES[extractingKey].base}/extract/${extractingId}`, {
       method: 'POST',
       signal: controller.signal,
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-    if (scanId !== extractingId || extractionController !== controller) return;
-    if (!Array.isArray(data.fields)) throw new Error('Invalid extraction response');
+    if (scanId !== extractingId || activeKey !== extractingKey || extractionController !== controller) return;
 
-    fieldsEl.textContent = JSON.stringify(data, null, 2);
-    fieldsEl.hidden = false;
-    fieldsStatusEl.hidden = true;
-    fieldCountEl.textContent = `${data.fields.length} ${data.fields.length === 1 ? 'field' : 'fields'} found`;
-    copyBtn.disabled = false;
+    renderExtraction(data);
   } catch (error) {
     if (error.name === 'AbortError') return;
     if (scanId !== extractingId || extractionController !== controller) return;
@@ -569,7 +668,7 @@ copyBtn.addEventListener('click', async () => {
 });
 
 function showResult(filename) {
-  result.src = `/scanned_document/${filename}?t=${Date.now()}`;
+  result.src = `${apiBase()}/scanned_document/${filename}?t=${Date.now()}`;
   processed.hidden = false;
 }
 
@@ -643,7 +742,7 @@ applyCropBtn.addEventListener('click', async () => {
   setStatus('Applying crop and refreshing JSON…', true);
   setError('');
   try {
-    const response = await fetch(`/crop/${scanId}`, {
+    const response = await fetch(`${apiBase()}/crop/${scanId}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ corners }),
