@@ -538,4 +538,25 @@ mod tests {
         assert_eq!(get("CITIZENSHIP NUMBER"), Some("161074-77"));
         assert_eq!(get("PASSPORT NUMBER"), Some("05516586"));
     }
+
+    #[test]
+    fn converts_printed_dates_to_iso_matching_the_mrz_dates() {
+        assert_eq!(dd_mon_yyyy_to_iso("06 APR 2011"), "2011-04-06");
+        assert_eq!(dd_mon_yyyy_to_iso("18 FEB 1992"), "1992-02-18");
+        // Not date-shaped: returned unchanged rather than mangled.
+        assert_eq!(dd_mon_yyyy_to_iso("SAPTARI"), "SAPTARI");
+    }
+
+    #[test]
+    fn finds_all_three_dates_in_reading_order() {
+        let lines = vec![
+            line("18 FEB 1992", 0.99, 12, 370),
+            line("06 APR 2011", 0.99, 12, 510),
+            line("05 APR 2021", 0.99, 12, 580),
+        ];
+        assert_eq!(
+            date_shaped_values(&lines),
+            vec!["18 FEB 1992", "06 APR 2011", "05 APR 2021"]
+        );
+    }
 }
