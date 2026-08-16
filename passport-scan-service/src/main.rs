@@ -1,4 +1,5 @@
 mod error;
+mod fields;
 mod local_ocr;
 mod mrz;
 mod routes;

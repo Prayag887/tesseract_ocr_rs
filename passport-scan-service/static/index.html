@@ -416,16 +416,22 @@ const modelBadgeEl = document.getElementById('modelBadge');
 
 // Two independent microservices (NID: Devanagari label/value parsing;
 // Passport: MRZ fixed-column + checksum decode) with no shared runtime —
-// only the frontend is shared, switching which origin it talks to.
+// only the frontend is shared, switching which origin/path it talks to.
+// In production both sit behind one nginx host, path-routed
+// (ocr.aieynora.xyz/nid/, ocr.aieynora.xyz/passport/, prefix stripped
+// before reaching each backend) — same-origin relative paths there, no
+// CORS involved. Local dev has no nginx in front, so each service is its
+// own origin/port instead.
+const IS_PROD = location.hostname === 'ocr.aieynora.xyz';
 const SERVICES = {
   nid: {
-    base: 'http://localhost:3002',
+    base: IS_PROD ? '/nid' : 'http://localhost:3002',
     badge: 'PP-OCRv5 · Devanagari',
     subtitle: 'Upload a Nepali national ID or citizenship card, confirm the crop, and receive structured label and value pairs.',
     extractingMessage: 'Reading label and value pairs with PP-OCRv5…',
   },
   passport: {
-    base: 'http://localhost:3003',
+    base: IS_PROD ? '/passport' : 'http://localhost:3003',
     badge: 'PP-OCRv5 · MRZ',
     subtitle: 'Upload a passport photo page, confirm the crop, and receive the decoded, checksum-verified MRZ.',
     extractingMessage: 'Reading the machine-readable zone with PP-OCRv5…',
@@ -605,7 +611,10 @@ function renderExtraction(data) {
     if (!Array.isArray(data.fields)) throw new Error('Invalid extraction response');
     fieldCountEl.textContent = `${data.fields.length} ${data.fields.length === 1 ? 'field' : 'fields'} found`;
   } else {
-    fieldCountEl.textContent = data.composite_check_ok ? 'MRZ checksum valid' : 'MRZ checksum FAILED';
+    // Flat passport document: MRZ-derived fields default to "" / false when
+    // no MRZ strip was found, so composite_check_ok alone tells you whether
+    // the checksum-verified half of the document is actually present.
+    fieldCountEl.textContent = data.composite_check_ok ? 'MRZ checksum valid' : 'no MRZ / checksum failed';
   }
   copyBtn.disabled = false;
 }

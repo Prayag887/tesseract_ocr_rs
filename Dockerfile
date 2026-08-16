@@ -43,6 +43,10 @@ ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib/x86_64-linux-gnu/pkg
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# models/devanagari_rec_dict.txt is pulled in at compile time via
+# include_str! (src/local_ocr.rs), so it must exist before `cargo build`,
+# not just in the runtime stage.
+COPY models ./models
 RUN cargo build --release
 
 ########## Stage 2: runtime ##########

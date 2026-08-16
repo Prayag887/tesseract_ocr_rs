@@ -6,8 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::local_ocr::MrzOcrEngine;
-use crate::mrz::MrzDocument;
+use crate::local_ocr::{MrzOcrEngine, PassportDocument};
 use crate::scanner;
 
 pub struct AppState {
@@ -124,7 +123,7 @@ pub async fn crop(
 pub async fn extract(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
-) -> Result<Json<MrzDocument>, AppError> {
+) -> Result<Json<PassportDocument>, AppError> {
     let path = state.output_dir.join(format!("{id}.jpg"));
     let image = tokio::fs::read(&path)
         .await

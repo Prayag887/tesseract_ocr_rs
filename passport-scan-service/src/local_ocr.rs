@@ -6,8 +6,11 @@ use opencv::core::{
 use opencv::prelude::*;
 use opencv::{dnn, geometry, imgcodecs, imgproc};
 
+use serde::Serialize;
+
 use crate::error::AppError;
-use crate::mrz::{self, MrzDocument};
+use crate::fields::{self, OcrLine};
+use crate::mrz;
 
 const DET_MODEL_PATH: &str = "models/ppocrv5_det.onnx";
 const TEXTLINE_ORI_MODEL_PATH: &str = "models/textline_ori.onnx";
@@ -47,6 +50,37 @@ const REC_MAX_WIDTH: i32 = 2000;
 /// a plausible MRZ row before it's padded/truncated for `mrz::parse_td3`.
 const MRZ_LINE_LEN: usize = 44;
 
+/// One flat document merging the MRZ's checksum-verified fields with what
+/// only the printed page carries (`full_name` as printed, `date_of_issue`
+/// — TD3's machine-readable zone has no columns for either, by ICAO spec).
+/// Left at defaults (empty string / `false`) when the MRZ strip isn't found
+/// or doesn't read cleanly, rather than failing the whole request — the
+/// printed-page fields still stand on their own.
+#[derive(Debug, Serialize, Default)]
+pub struct PassportDocument {
+    pub document_type: String,
+    pub issuing_country: String,
+    pub surname: String,
+    pub given_names: String,
+    pub full_name: String,
+    pub passport_number: String,
+    pub nationality: String,
+    /// ISO 8601 (YYYY-MM-DD), century resolved relative to today.
+    pub date_of_birth: String,
+    pub sex: String,
+    /// From the printed page only — not in the MRZ.
+    pub date_of_issue: String,
+    /// ISO 8601 (YYYY-MM-DD), century resolved relative to today.
+    pub date_of_expiry: String,
+    pub personal_number: String,
+    pub expired: bool,
+    pub passport_number_check_ok: bool,
+    pub date_of_birth_check_ok: bool,
+    pub date_of_expiry_check_ok: bool,
+    pub personal_number_check_ok: bool,
+    pub composite_check_ok: bool,
+}
+
 pub struct MrzOcrEngine {
     det: Mutex<dnn::Net>,
     textline_ori: Mutex<dnn::Net>,
@@ -81,7 +115,7 @@ impl MrzOcrEngine {
         })
     }
 
-    pub async fn extract(&self, image: &[u8]) -> Result<MrzDocument, AppError> {
+    pub async fn extract(&self, image: &[u8]) -> Result<PassportDocument, AppError> {
         let buf = Vector::<u8>::from_slice(image);
         let bgr = imgcodecs::imdecode(&buf, imgcodecs::IMREAD_COLOR).map_err(AppError::Decode)?;
         if bgr.empty() {
@@ -90,41 +124,124 @@ impl MrzOcrEngine {
 
         let quads = detect_text_boxes(&self.det, &bgr)?;
 
-        let mut lines: Vec<(String, f32, i32)> = Vec::with_capacity(quads.len());
+        // Raw recognized text, untouched — the visual field parser below
+        // needs real case/punctuation/Devanagari, not the MRZ's
+        // uppercase-only alphabet. MRZ-specific normalization happens
+        // separately, per-line, only when picking MRZ candidates.
+        let mut lines: Vec<OcrLine> = Vec::with_capacity(quads.len());
         for quad in quads {
             let crop = crop_quad(&bgr, &quad)?;
             let crop = classify_and_fix_rotation(&self.textline_ori, crop)?;
             let (text, confidence) = recognize_line(&self.rec, &self.rec_vocab, &crop)?;
-            let text = normalize_mrz_chars(text.trim());
+            let text = text.trim();
             if text.is_empty() || confidence < self.min_confidence {
                 continue;
             }
-            let top = quad.iter().map(|p| p.y).fold(f32::MAX, f32::min).round() as i32;
-            lines.push((text, confidence, top));
+            lines.push(OcrLine {
+                text: text.to_owned(),
+                confidence,
+                polygon: quad.map(|p| [p.x.round() as i32, p.y.round() as i32]),
+            });
+        }
+        lines.sort_by(fields::reading_order);
+
+        if std::env::var("OCR_DEBUG_LINES").is_ok() {
+            for (i, line) in lines.iter().enumerate() {
+                tracing::info!("line {i}: {:?} conf={:.3}", line.text, line.confidence);
+            }
         }
 
-        // MRZ rows are the two bottommost lines that are long, dense in
-        // MRZ-valid characters, and close to the fixed 44-char TD3 width —
-        // no label/keyword to anchor on, unlike the NID service's field
-        // parser, since the MRZ has none.
-        lines.sort_by_key(|(_, _, top)| *top);
-        let mrz_candidates: Vec<&(String, f32, i32)> = lines
-            .iter()
-            .filter(|(text, _, _)| looks_like_mrz_line(text))
-            .collect();
+        let mut doc = PassportDocument::default();
+        if let Some(mrz) = extract_mrz(&lines) {
+            doc.document_type = mrz.document_type;
+            doc.issuing_country = mrz.issuing_country;
+            doc.surname = mrz.surname;
+            doc.given_names = mrz.given_names;
+            doc.passport_number = mrz.passport_number;
+            doc.nationality = mrz.nationality;
+            doc.date_of_birth = mrz.date_of_birth;
+            doc.sex = mrz.sex;
+            doc.date_of_expiry = mrz.date_of_expiry;
+            doc.personal_number = mrz.personal_number;
+            doc.expired = mrz.expired;
+            doc.passport_number_check_ok = mrz.passport_number_check_ok;
+            doc.date_of_birth_check_ok = mrz.date_of_birth_check_ok;
+            doc.date_of_expiry_check_ok = mrz.date_of_expiry_check_ok;
+            doc.personal_number_check_ok = mrz.personal_number_check_ok;
+            doc.composite_check_ok = mrz.composite_check_ok;
+        }
 
-        let [line1, line2] = mrz_candidates
-            .iter()
-            .rev()
-            .take(2)
-            .rev()
-            .map(|(text, ..)| pad_or_truncate_mrz(text))
+        // Visual OCR fills in what the MRZ structurally can't (date of
+        // issue) and, when found, overrides surname/given names with the
+        // as-printed version — more legible than the MRZ's filler-padded,
+        // truncated name fields.
+        let visual_fields = fields::parse_fields(&lines);
+        let get = |label: &str| {
+            visual_fields
+                .iter()
+                .find(|field| field.label == label)
+                .map(|field| field.value.clone())
+        };
+        if let Some(surname) = get("SURNAME") {
+            doc.surname = surname;
+        }
+        if let Some(given_names) = get("GIVEN NAMES") {
+            doc.given_names = given_names;
+        }
+        // MRZ's "personal number" field is optional/issuer-defined — Nepal
+        // puts the citizenship number there (undashed, since '-' isn't in
+        // the MRZ alphabet). Prefer the as-printed, dashed version when the
+        // visual OCR found it.
+        if let Some(citizenship_number) = get("CITIZENSHIP NUMBER") {
+            doc.personal_number = citizenship_number;
+        }
+        doc.date_of_issue = get("DATE OF ISSUE").unwrap_or_else(|| {
+            // Label-keyword match failed — fall back to position, but only
+            // when exactly the 3 expected dates (birth, issue, expiry) were
+            // found; otherwise a garbled/missing detection elsewhere would
+            // silently misassign this. The MRZ can't supply date of issue
+            // at all, so this positional guess is its only fallback.
+            let dates = fields::date_shaped_values(&lines);
+            if dates.len() == 3 {
+                dates[1].clone()
+            } else {
+                String::new()
+            }
+        });
+        doc.full_name = [doc.given_names.as_str(), doc.surname.as_str()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
-            .try_into()
-            .map_err(|_| AppError::MrzNotFound)?;
+            .join(" ");
 
-        mrz::parse_td3(&line1, &line2)
+        Ok(doc)
     }
+}
+
+/// MRZ rows are the two bottommost lines that are long, dense in MRZ-valid
+/// characters, and close to the fixed 44-char TD3 width — no label/keyword
+/// to anchor on, unlike the visual fields, since the MRZ has none. Tolerant
+/// by design: returns `None` rather than propagating an error, since the
+/// visual fields are the primary data and shouldn't be discarded just
+/// because the MRZ strip wasn't in frame or didn't read cleanly.
+fn extract_mrz(lines: &[OcrLine]) -> Option<mrz::MrzFields> {
+    let mut candidates: Vec<&OcrLine> = lines
+        .iter()
+        .filter(|line| looks_like_mrz_line(&normalize_mrz_chars(&line.text)))
+        .collect();
+    candidates.sort_by_key(|line| line.polygon.iter().map(|p| p[1]).min().unwrap_or(0));
+
+    let [line1, line2] = candidates
+        .iter()
+        .rev()
+        .take(2)
+        .rev()
+        .map(|line| pad_or_truncate_mrz(&normalize_mrz_chars(&line.text)))
+        .collect::<Vec<_>>()
+        .try_into()
+        .ok()?;
+
+    mrz::parse_td3(&line1, &line2).ok()
 }
 
 /// Maps common OCR-B misreads to their MRZ alphabet equivalents and drops
