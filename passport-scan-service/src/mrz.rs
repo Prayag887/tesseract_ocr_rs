@@ -237,6 +237,19 @@ mod tests {
     }
 
     #[test]
+    fn discards_garbled_padding_after_a_names_double_filler() {
+        // Real OCR misread from a Nepal passport: the padding tail after
+        // "RAM<KUMAR" got misread as stray letters instead of clean '<'
+        // fillers. clean_name must stop at the first "<<", not treat every
+        // '<' as equivalent spacing and append the garbage as name content.
+        let line1 = "P<NPLYADAV<<RAM<KUMAR<<E<SS<<<<<<<<<<<<S<SKE";
+        let (surname_raw, given_raw) =
+            line1[5..44].split_once("<<").expect("has surname/given split");
+        assert_eq!(clean_name(surname_raw), "YADAV");
+        assert_eq!(clean_name(given_raw), "RAM KUMAR");
+    }
+
+    #[test]
     fn flags_a_tampered_passport_number() {
         let tampered = "L898902C46UTO7408122F1204159ZE184226B<<<<<10";
         let doc = parse_td3(LINE1, tampered).expect("still 44 chars, just wrong checksum");

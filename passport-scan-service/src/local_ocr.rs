@@ -195,19 +195,21 @@ impl MrzOcrEngine {
         if let Some(citizenship_number) = get("CITIZENSHIP NUMBER") {
             doc.personal_number = citizenship_number;
         }
-        doc.date_of_issue = get("DATE OF ISSUE").unwrap_or_else(|| {
+        let date_of_issue_raw = get("DATE OF ISSUE").or_else(|| {
             // Label-keyword match failed — fall back to position, but only
             // when exactly the 3 expected dates (birth, issue, expiry) were
             // found; otherwise a garbled/missing detection elsewhere would
             // silently misassign this. The MRZ can't supply date of issue
             // at all, so this positional guess is its only fallback.
             let dates = fields::date_shaped_values(&lines);
-            if dates.len() == 3 {
-                dates[1].clone()
-            } else {
-                String::new()
-            }
+            (dates.len() == 3).then(|| dates[1].clone())
         });
+        // Match the MRZ dates' ISO 8601 format — one consistent date shape
+        // across the whole response, not raw OCR text in one field and ISO
+        // in the others.
+        doc.date_of_issue = date_of_issue_raw
+            .map(|raw| fields::dd_mon_yyyy_to_iso(&raw))
+            .unwrap_or_default();
         doc.full_name = [doc.given_names.as_str(), doc.surname.as_str()]
             .into_iter()
             .filter(|part| !part.is_empty())
