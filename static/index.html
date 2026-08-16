@@ -251,32 +251,6 @@
   .crop-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 12px; }
   .crop-actions button { margin: 0; }
 
-  .processed {
-    margin-top: 16px;
-    padding-top: 16px;
-    border-top: 1px solid var(--line);
-  }
-
-  .processed-label {
-    margin: 0 0 9px;
-    color: var(--muted);
-    font-size: 0.73rem;
-    font-weight: 780;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-  }
-
-  #result {
-    display: block;
-    width: auto;
-    max-width: 100%;
-    max-height: 150px;
-    margin: 0 auto;
-    border: 1px solid var(--line);
-    border-radius: 10px;
-    object-fit: contain;
-  }
-
   .count {
     color: var(--muted);
     font-size: 0.8rem;
@@ -368,10 +342,6 @@
           <button id="applyCropBtn" type="button">Apply crop &amp; re-extract</button>
           <button id="resetCropBtn" type="button" class="secondary">Reset corners</button>
         </div>
-        <div id="processed" class="processed" hidden>
-          <p class="processed-label">Processed crop</p>
-          <img id="result" alt="Processed document crop">
-        </div>
       </div>
     </article>
 
@@ -401,8 +371,6 @@ const orig = document.getElementById('orig');
 const overlay = document.getElementById('cropOverlay');
 const applyCropBtn = document.getElementById('applyCropBtn');
 const resetCropBtn = document.getElementById('resetCropBtn');
-const processed = document.getElementById('processed');
-const result = document.getElementById('result');
 const statusEl = document.getElementById('status');
 const errorEl = document.getElementById('error');
 const fieldsStatusEl = document.getElementById('fieldsStatus');
@@ -533,23 +501,61 @@ function setError(message) {
   errorEl.hidden = !message;
 }
 
-function setFile(file) {
+// Camera photos routinely land at 8-15MB despite having no more usable
+// resolution for OCR than a fraction of that — the entire upload+decode
+// latency users hit is spent moving/processing bytes the pipeline never
+// needed. Resizing client-side before upload (not raising server limits,
+// not "just wait longer") is the actual fix, not a workaround for one.
+const MAX_UPLOAD_DIMENSION = 2200;
+const UPLOAD_JPEG_QUALITY = 0.9;
+
+async function prepareForUpload(file) {
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+  } catch {
+    return file; // format createImageBitmap can't decode — upload as-is
+  }
+  const longestSide = Math.max(bitmap.width, bitmap.height);
+  if (longestSide <= MAX_UPLOAD_DIMENSION) {
+    bitmap.close?.();
+    return file;
+  }
+  const scale = MAX_UPLOAD_DIMENSION / longestSide;
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(bitmap.width * scale);
+  canvas.height = Math.round(bitmap.height * scale);
+  canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close?.();
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', UPLOAD_JPEG_QUALITY));
+  return blob ? new File([blob], file.name.replace(/\.\w+$/, '.jpg'), { type: 'image/jpeg' }) : file;
+}
+
+async function setFile(file) {
   extractionController?.abort();
   extractionController = null;
-  if (originalObjectUrl) URL.revokeObjectURL(originalObjectUrl);
-  originalObjectUrl = URL.createObjectURL(file);
+  const originalName = file.name;
+  setStatus('Preparing image…', true);
 
-  currentFile = file;
+  // Resized version drives both the preview and the upload — the corner
+  // coordinates the server returns are in the uploaded image's pixel
+  // space, so preview and upload must be the exact same bytes or the crop
+  // overlay would map to the wrong coordinates.
+  const prepared = await prepareForUpload(file);
+
+  if (originalObjectUrl) URL.revokeObjectURL(originalObjectUrl);
+  originalObjectUrl = URL.createObjectURL(prepared);
+
+  currentFile = prepared;
   scanId = null;
   detectedCorners = null;
   corners = null;
   orig.src = originalObjectUrl;
   overlay.replaceChildren();
 
-  fileNameEl.textContent = file.name;
+  fileNameEl.textContent = originalName;
   workspace.hidden = false;
   cropActions.hidden = true;
-  processed.hidden = true;
   fieldsEl.hidden = true;
   fieldsEl.textContent = '';
   fieldsStatusEl.hidden = false;
@@ -564,7 +570,6 @@ function setFile(file) {
 scanBtn.addEventListener('click', async () => {
   if (!currentFile) return;
   scanBtn.disabled = true;
-  processed.hidden = true;
   fieldsEl.hidden = true;
   fieldsStatusEl.hidden = false;
   fieldsStatusEl.textContent = 'Detecting the document and preparing OCR…';
@@ -584,7 +589,6 @@ scanBtn.addEventListener('click', async () => {
     scanId = data.id;
     detectedCorners = data.corners;
     corners = data.corners.map((point) => [...point]);
-    showResult(data.filename);
     setupCropUI();
     setStatus(
       data.corners_detected
@@ -676,11 +680,6 @@ copyBtn.addEventListener('click', async () => {
   window.setTimeout(() => { copyBtn.textContent = 'Copy JSON'; }, 1400);
 });
 
-function showResult(filename) {
-  result.src = `${apiBase()}/scanned_document/${filename}?t=${Date.now()}`;
-  processed.hidden = false;
-}
-
 function setupCropUI() {
   cropActions.hidden = false;
   if (orig.complete) drawOverlay();
@@ -758,7 +757,6 @@ applyCropBtn.addEventListener('click', async () => {
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-    showResult(data.filename);
     await runExtraction();
     setStatus('Crop applied and JSON refreshed.', false);
   } catch (error) {

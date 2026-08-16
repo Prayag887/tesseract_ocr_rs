@@ -78,18 +78,45 @@ fn is_dd_mon_yyyy(text: &str) -> bool {
     dd_mon_yyyy_parts(text).is_some()
 }
 
-fn dd_mon_yyyy_parts(text: &str) -> Option<(u32, u32, &str)> {
-    let parts: Vec<&str> = text.split_whitespace().collect();
-    let [day, month, year] = parts.as_slice() else {
+/// Day must lead, year must trail, and a recognized month abbreviation
+/// must appear somewhere between them — but anything else between day and
+/// year is ignored rather than rejecting the whole line. Needed for
+/// bilingual foreign passports, where the printed date is e.g. a
+/// non-Latin month name alongside its English abbreviation
+/// (`05 <script>/JUL 23`, split on '/' same as whitespace): the non-Latin
+/// script routinely OCRs as garbage through this Devanagari-vocab
+/// recognizer, but it was never data worth keeping anyway — only the
+/// English abbreviation is.
+fn dd_mon_yyyy_parts(text: &str) -> Option<(u32, u32, i32)> {
+    let tokens: Vec<&str> = text
+        .split(|c: char| c.is_whitespace() || c == '/')
+        .filter(|token| !token.is_empty())
+        .collect();
+    let (first, rest) = tokens.split_first()?;
+    let (last, middle) = rest.split_last()?;
+    if middle.is_empty() {
         return None;
-    };
-    let day_ok = (1..=2).contains(&day.len()) && day.chars().all(|c| c.is_ascii_digit());
-    let month_index = MONTH_ABBREVIATIONS
+    }
+    let day_ok = (1..=2).contains(&first.len()) && first.chars().all(|c| c.is_ascii_digit());
+    let year_ok = (last.len() == 2 || last.len() == 4) && last.chars().all(|c| c.is_ascii_digit());
+    if !day_ok || !year_ok {
+        return None;
+    }
+    let month = middle
         .iter()
-        .position(|m| *m == month.to_uppercase())
-        .map(|index| index as u32 + 1)?;
-    let year_ok = year.len() == 4 && year.chars().all(|c| c.is_ascii_digit());
-    (day_ok && year_ok).then(|| (day.parse().unwrap_or(0), month_index, *year))
+        .find_map(|token| MONTH_ABBREVIATIONS.iter().position(|m| *m == token.to_uppercase()))?
+        as u32
+        + 1;
+    let day: u32 = first.parse().ok()?;
+    let year: i32 = if last.len() == 2 {
+        // Unlike an MRZ birth date, a printed date of issue/expiry on a
+        // passport being scanned today is never plausibly pre-2000 — no
+        // century-ambiguity handling needed, always the current century.
+        2000 + last.parse::<i32>().ok()?
+    } else {
+        last.parse().ok()?
+    };
+    Some((day, month, year))
 }
 
 /// Converts an OCR-read `18 FEB 1992`-shaped value to ISO 8601
@@ -98,7 +125,7 @@ fn dd_mon_yyyy_parts(text: &str) -> Option<(u32, u32, &str)> {
 /// Returns the original text unchanged if it isn't actually date-shaped.
 pub fn dd_mon_yyyy_to_iso(text: &str) -> String {
     match dd_mon_yyyy_parts(text) {
-        Some((day, month, year)) => format!("{year}-{month:02}-{day:02}"),
+        Some((day, month, year)) => format!("{year:04}-{month:02}-{day:02}"),
         None => text.to_owned(),
     }
 }
@@ -545,6 +572,15 @@ mod tests {
         assert_eq!(dd_mon_yyyy_to_iso("18 FEB 1992"), "1992-02-18");
         // Not date-shaped: returned unchanged rather than mangled.
         assert_eq!(dd_mon_yyyy_to_iso("SAPTARI"), "SAPTARI");
+    }
+
+    #[test]
+    fn ignores_a_non_latin_month_name_misread_as_garbage() {
+        // Real case: a foreign passport prints day / non-Latin-script month
+        // name / English month abbreviation / 2-digit year. The Devanagari
+        // recognizer garbles the non-Latin script into noise ("AMn") — it
+        // was never usable data, only the "JUL" abbreviation matters.
+        assert_eq!(dd_mon_yyyy_to_iso("05 AMn/JUL 23"), "2023-07-05");
     }
 
     #[test]

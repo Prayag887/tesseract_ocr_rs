@@ -31,7 +31,7 @@ const NET_OUTPUT_NAME: &str = "fetch_name_0";
 // Same PP-OCRv5_mobile_det hyperparameters as the NID service's OCR.yaml —
 // the detection model is script-agnostic, only the recognizer differs.
 const DET_LIMIT_SIDE_LEN: i32 = 64;
-const DET_MAX_SIDE_LIMIT: i32 = 4000;
+const DET_MAX_SIDE_LIMIT: i32 = 1600;
 const DET_THRESH: f64 = 0.3;
 const DET_BOX_THRESH: f32 = 0.6;
 const DET_UNCLIP_RATIO: f32 = 1.5;
@@ -115,24 +115,53 @@ impl MrzOcrEngine {
         })
     }
 
+    /// Dispatches the actually-synchronous, CPU-bound work in
+    /// `extract_blocking` onto the blocking pool so it can't stall the
+    /// async reactor — same reasoning as `scanner::scan_document`, which
+    /// this function previously lacked despite doing the same kind of
+    /// OpenCV/dnn work: an unrelated request (a static file GET, another
+    /// scan's `/health` check) sharing this worker thread would queue up
+    /// behind however long OCR inference takes on a small VM.
     pub async fn extract(&self, image: &[u8]) -> Result<PassportDocument, AppError> {
+        tokio::task::block_in_place(|| self.extract_blocking(image))
+    }
+
+    fn extract_blocking(&self, image: &[u8]) -> Result<PassportDocument, AppError> {
+        let debug = std::env::var("OCR_DEBUG_TIMING").is_ok();
+        let t0 = std::time::Instant::now();
+
         let buf = Vector::<u8>::from_slice(image);
         let bgr = imgcodecs::imdecode(&buf, imgcodecs::IMREAD_COLOR).map_err(AppError::Decode)?;
         if bgr.empty() {
             return Err(AppError::EmptyImage);
         }
+        if debug {
+            let size = bgr.size().unwrap_or_default();
+            eprintln!("[ocr_timing] decode: {:?} ({}x{})", t0.elapsed(), size.width, size.height);
+        }
 
+        let t1 = std::time::Instant::now();
         let quads = detect_text_boxes(&self.det, &bgr)?;
+        if debug {
+            eprintln!("[ocr_timing] detect_text_boxes: {:?} ({} boxes)", t1.elapsed(), quads.len());
+        }
 
         // Raw recognized text, untouched — the visual field parser below
         // needs real case/punctuation/Devanagari, not the MRZ's
         // uppercase-only alphabet. MRZ-specific normalization happens
         // separately, per-line, only when picking MRZ candidates.
+        let t2 = std::time::Instant::now();
+        let mut rotate_total = std::time::Duration::ZERO;
+        let mut recognize_total = std::time::Duration::ZERO;
         let mut lines: Vec<OcrLine> = Vec::with_capacity(quads.len());
         for quad in quads {
             let crop = crop_quad(&bgr, &quad)?;
+            let tr = std::time::Instant::now();
             let crop = classify_and_fix_rotation(&self.textline_ori, crop)?;
+            rotate_total += tr.elapsed();
+            let trec = std::time::Instant::now();
             let (text, confidence) = recognize_line(&self.rec, &self.rec_vocab, &crop)?;
+            recognize_total += trec.elapsed();
             let text = text.trim();
             if text.is_empty() || confidence < self.min_confidence {
                 continue;
@@ -143,7 +172,19 @@ impl MrzOcrEngine {
                 polygon: quad.map(|p| [p.x.round() as i32, p.y.round() as i32]),
             });
         }
+        if debug {
+            eprintln!(
+                "[ocr_timing] per-line loop (x{}): {:?} total — rotate-classify: {:?}, recognize: {:?}",
+                lines.len(),
+                t2.elapsed(),
+                rotate_total,
+                recognize_total,
+            );
+        }
         lines.sort_by(fields::reading_order);
+        if debug {
+            eprintln!("[ocr_timing] total: {:?}", t0.elapsed());
+        }
 
         if std::env::var("OCR_DEBUG_LINES").is_ok() {
             for (i, line) in lines.iter().enumerate() {
@@ -172,9 +213,15 @@ impl MrzOcrEngine {
         }
 
         // Visual OCR fills in what the MRZ structurally can't (date of
-        // issue) and, when found, overrides surname/given names with the
-        // as-printed version — more legible than the MRZ's filler-padded,
-        // truncated name fields.
+        // issue) — but NOT names: MRZ names are ICAO-mandated pure Latin
+        // transliteration, always clean, whereas the printed page on a
+        // foreign passport often prints the name in the local script
+        // alongside its Latin transliteration (e.g. "МАРІАНА/MARIANA").
+        // This recognizer has no non-Latin vocab for that script, so it
+        // hallucinates Latin lookalikes instead of failing cleanly
+        // ("MAP'AHA/MARIANA") — trusting that over the MRZ would make
+        // names *worse*, not better, on exactly the documents where it'd
+        // matter most.
         let visual_fields = fields::parse_fields(&lines);
         let get = |label: &str| {
             visual_fields
@@ -182,12 +229,6 @@ impl MrzOcrEngine {
                 .find(|field| field.label == label)
                 .map(|field| field.value.clone())
         };
-        if let Some(surname) = get("SURNAME") {
-            doc.surname = surname;
-        }
-        if let Some(given_names) = get("GIVEN NAMES") {
-            doc.given_names = given_names;
-        }
         // MRZ's "personal number" field is optional/issuer-defined — Nepal
         // puts the citizenship number there (undashed, since '-' isn't in
         // the MRZ alphabet). Prefer the as-printed, dashed version when the

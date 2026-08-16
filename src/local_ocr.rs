@@ -81,7 +81,17 @@ impl LocalOcrEngine {
         })
     }
 
+    /// Dispatches the actually-synchronous, CPU-bound work in
+    /// `extract_blocking` onto the blocking pool so it can't stall the
+    /// async reactor — same reasoning as `scanner::scan_document`, which
+    /// this function previously lacked despite doing the same kind of
+    /// OpenCV/dnn work: an unrelated request sharing this worker thread
+    /// would queue up behind however long OCR inference takes.
     pub async fn extract(&self, image: &[u8]) -> Result<OcrDocument, AppError> {
+        tokio::task::block_in_place(|| self.extract_blocking(image))
+    }
+
+    fn extract_blocking(&self, image: &[u8]) -> Result<OcrDocument, AppError> {
         let buf = Vector::<u8>::from_slice(image);
         let bgr = imgcodecs::imdecode(&buf, imgcodecs::IMREAD_COLOR).map_err(AppError::Decode)?;
         if bgr.empty() {
