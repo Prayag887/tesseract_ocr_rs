@@ -4,7 +4,9 @@ use opencv::core::{
     CV_8U, Mat, MatTraitConst, Point, Point2f, Rect, RotatedRect, Scalar, Size, Vec3b, Vector,
 };
 use opencv::prelude::*;
-use opencv::{dnn, geometry, imgcodecs, imgproc};
+use opencv::{imgcodecs, imgproc};
+use ort::session::Session;
+use ort::value::Tensor;
 
 use crate::error::AppError;
 use crate::ocr::{Field, OcrDocument, OcrLine, parse_fields, reading_order};
@@ -44,12 +46,17 @@ const REC_MAX_WIDTH: i32 = 2000;
 /// Native ONNX inference for PP-OCRv5, replacing the Python PaddleX sidecar
 /// (`PaddleOcrClient`) for latency: no HTTP round-trip, no Python process.
 /// Same three models the sidecar ran (`OCR.yaml`), same math, run in-process
-/// via OpenCV's `dnn` module — the same pattern already used in
-/// `scanner.rs` for the document-corner model.
+/// via `ort` (ONNX Runtime) — not OpenCV's `dnn` module, which cannot load
+/// the recognizer at all: that model takes a genuinely variable-width input
+/// (width is derived per crop from its aspect ratio, see `recognize_line`),
+/// and OpenCV 4.6's importer resolves `Shape` nodes statically at load time,
+/// so it aborts on the dynamic axis. `ort` supports dynamic shapes natively.
+/// `scanner.rs`'s `DocDetector` runs on `ort` for its own reasons, which
+/// together let `opencv` drop the `dnn` feature entirely.
 pub struct LocalOcrEngine {
-    det: Mutex<dnn::Net>,
-    textline_ori: Mutex<dnn::Net>,
-    rec: Mutex<dnn::Net>,
+    det: Mutex<Session>,
+    textline_ori: Mutex<Session>,
+    rec: Mutex<Session>,
     /// index 0 = CTC blank, 1..=568 = `devanagari_rec_dict.txt`, 569 = space
     /// — the exact convention `inference.yml`'s `character_dict` encodes.
     rec_vocab: Vec<&'static str>,
@@ -58,9 +65,9 @@ pub struct LocalOcrEngine {
 
 impl LocalOcrEngine {
     pub fn load() -> Result<Self, AppError> {
-        let det = dnn::read_net_from_onnx_def(DET_MODEL_PATH)?;
-        let textline_ori = dnn::read_net_from_onnx_def(TEXTLINE_ORI_MODEL_PATH)?;
-        let rec = dnn::read_net_from_onnx_def(REC_MODEL_PATH)?;
+        let det = Session::builder()?.commit_from_file(DET_MODEL_PATH)?;
+        let textline_ori = Session::builder()?.commit_from_file(TEXTLINE_ORI_MODEL_PATH)?;
+        let rec = Session::builder()?.commit_from_file(REC_MODEL_PATH)?;
 
         let mut rec_vocab = Vec::with_capacity(570);
         rec_vocab.push(""); // CTC blank
@@ -117,23 +124,23 @@ impl LocalOcrEngine {
     }
 }
 
-fn forward(net: &Mutex<dnn::Net>, blob: &Mat) -> Result<Mat, AppError> {
-    let mut net = net.lock().expect("dnn::Net mutex poisoned");
-    net.set_input(blob, NET_INPUT_NAME, 1.0, Scalar::all(0.0))?;
-    let mut outputs = Vector::<Mat>::new();
-    let names = Vector::<String>::from_iter([NET_OUTPUT_NAME]);
-    net.forward(&mut outputs, &names)?;
-    Ok(outputs.get(0)?)
+fn forward(net: &Mutex<Session>, shape: [usize; 4], data: Vec<f32>) -> Result<(Vec<i64>, Vec<f32>), AppError> {
+    let input = Tensor::from_array((shape, data))?;
+    let mut net = net.lock().expect("ort Session mutex poisoned");
+    let outputs = net.run(ort::inputs![NET_INPUT_NAME => input])?;
+    let (out_shape, out_data) = outputs[NET_OUTPUT_NAME].try_extract_tensor::<f32>()?;
+    Ok((out_shape.to_vec(), out_data.to_vec()))
 }
 
 /// Packs an already-resized RGB `u8` `Mat` into an NCHW `f32` tensor,
-/// applying `(pixel/255 - mean) / std` per channel. Built by hand rather
-/// than through `dnn::blob_from_image` because that helper only supports a
-/// single `scalefactor` shared across channels, and ImageNet's per-channel
-/// std values differ slightly — close enough that the difference wouldn't
-/// be visually obvious, but exact math was verified against real recognized
-/// text before trusting it, and there's no reason to settle for approximate
-/// when exact costs the same amount of code.
+/// applying `(pixel/255 - mean) / std` per channel. Built by hand because
+/// OpenCV's own `dnn::blob_from_image` only supports a single `scalefactor`
+/// shared across channels, and ImageNet's per-channel std values differ
+/// slightly — close enough that the difference wouldn't be visually
+/// obvious, but exact math was verified against real recognized text before
+/// trusting it, and there's no reason to settle for approximate when exact
+/// costs the same amount of code. (Moot now that `dnn` is no longer a
+/// dependency, but the hand-rolled packing is still what feeds `ort`.)
 fn imagenet_nchw(rgb: &Mat) -> Result<Vec<f32>, AppError> {
     let rows = rgb.rows();
     let cols = rgb.cols();
@@ -167,10 +174,6 @@ fn rec_nchw(rgb: &Mat) -> Result<Vec<f32>, AppError> {
     Ok(out)
 }
 
-fn nchw_blob(sizes: &[i32], data: &[f32]) -> Result<Mat, AppError> {
-    Ok(Mat::new_nd_with_data(sizes, data)?.try_clone()?)
-}
-
 /// DB's side-limit resize rule (`limit_type: min`) plus PaddleX's
 /// `max_side_limit` cap, rounded to a multiple of 32 as the detection
 /// backbone requires. Matches `OCR.yaml` exactly.
@@ -195,7 +198,7 @@ fn det_resize_dims(height: i32, width: i32) -> (i32, i32) {
 /// bottom-left] — DB thresholding + contour extraction + unclip, the same
 /// postprocessing PaddleX's server-side pipeline does for
 /// `PP-OCRv5_mobile_det`.
-fn detect_text_boxes(det: &Mutex<dnn::Net>, image: &Mat) -> Result<Vec<[Point2f; 4]>, AppError> {
+fn detect_text_boxes(det: &Mutex<Session>, image: &Mat) -> Result<Vec<[Point2f; 4]>, AppError> {
     let size = image.size()?;
     let (orig_w, orig_h) = (size.width, size.height);
     let (resize_h, resize_w) = det_resize_dims(orig_h, orig_w);
@@ -213,9 +216,8 @@ fn detect_text_boxes(det: &Mutex<dnn::Net>, image: &Mat) -> Result<Vec<[Point2f;
     imgproc::cvt_color_def(&resized_bgr, &mut resized_rgb, imgproc::COLOR_BGR2RGB)?;
 
     let data = imagenet_nchw(&resized_rgb)?;
-    let blob = nchw_blob(&[1, 3, resize_h, resize_w], &data)?;
-    let prob_map = forward(det, &blob)?;
-    let prob_2d: Mat = prob_map.reshape(1, resize_h)?.try_clone()?;
+    let (_shape, prob_data) = forward(det, [1, 3, resize_h as usize, resize_w as usize], data)?;
+    let prob_2d: Mat = Mat::new_rows_cols_with_data(resize_h, resize_w, &prob_data)?.try_clone()?;
 
     let mut binary = Mat::default();
     imgproc::threshold(
@@ -244,7 +246,7 @@ fn detect_text_boxes(det: &Mutex<dnn::Net>, image: &Mat) -> Result<Vec<[Point2f;
         if contour.len() < 3 {
             continue;
         }
-        let rect = geometry::min_area_rect(&contour)?;
+        let rect = imgproc::min_area_rect(&contour)?;
         if rect.size.width.min(rect.size.height) < DET_MIN_BOX_SIDE {
             continue;
         }
@@ -396,7 +398,7 @@ fn crop_quad(image: &Mat, corners: &[Point2f; 4]) -> Result<Mat, AppError> {
         Point2f::new((width - 1) as f32, (height - 1) as f32),
         Point2f::new(0.0, (height - 1) as f32),
     ];
-    let transform = geometry::get_perspective_transform_slice_def([tl, tr, br, bl], dst)?;
+    let transform = imgproc::get_perspective_transform_slice_def([tl, tr, br, bl], dst)?;
 
     let mut warped = Mat::default();
     imgproc::warp_perspective_def(image, &mut warped, &transform, Size::new(width, height))?;
@@ -410,7 +412,7 @@ fn crop_quad(image: &Mat, corners: &[Point2f; 4]) -> Result<Mat, AppError> {
 /// known-rotated ground-truth line, since every line on the real test scan
 /// was already upright. Low risk: on a misclassification the crop is used
 /// as-is, same as if this step didn't run at all.
-fn classify_and_fix_rotation(textline_ori: &Mutex<dnn::Net>, crop: Mat) -> Result<Mat, AppError> {
+fn classify_and_fix_rotation(textline_ori: &Mutex<Session>, crop: Mat) -> Result<Mat, AppError> {
     let size = crop.size()?;
     if size.width < 1 || size.height < 1 {
         return Ok(crop);
@@ -428,11 +430,13 @@ fn classify_and_fix_rotation(textline_ori: &Mutex<dnn::Net>, crop: Mat) -> Resul
     let mut rgb = Mat::default();
     imgproc::cvt_color_def(&resized, &mut rgb, imgproc::COLOR_BGR2RGB)?;
     let data = imagenet_nchw(&rgb)?;
-    let blob = nchw_blob(&[1, 3, TEXTLINE_ORI_HEIGHT, TEXTLINE_ORI_WIDTH], &data)?;
-    let out = forward(textline_ori, &blob)?;
+    let (_shape, out) = forward(
+        textline_ori,
+        [1, 3, TEXTLINE_ORI_HEIGHT as usize, TEXTLINE_ORI_WIDTH as usize],
+        data,
+    )?;
 
-    let upright: f32 = *out.at_2d(0, 0)?;
-    let flipped: f32 = *out.at_2d(0, 1)?;
+    let (upright, flipped) = (out[0], out[1]);
     if flipped > upright {
         let mut rotated = Mat::default();
         opencv::core::flip(&crop, &mut rotated, -1)?;
@@ -448,7 +452,7 @@ fn classify_and_fix_rotation(textline_ori: &Mutex<dnn::Net>, crop: Mat) -> Resul
 /// against real recognized text ("ROSHAN JOSHI", "DATE OF BIRTH", "SEX",
 /// "M", "2003-01-24") before being wired in here.
 fn recognize_line(
-    rec: &Mutex<dnn::Net>,
+    rec: &Mutex<Session>,
     vocab: &[&str],
     crop: &Mat,
 ) -> Result<(String, f32), AppError> {
@@ -472,24 +476,21 @@ fn recognize_line(
     let mut rgb = Mat::default();
     imgproc::cvt_color_def(&resized, &mut rgb, imgproc::COLOR_BGR2RGB)?;
     let data = rec_nchw(&rgb)?;
-    let blob = nchw_blob(&[1, 3, REC_HEIGHT, new_w], &data)?;
-    let out = forward(rec, &blob)?;
-
-    let dims = out.mat_size();
-    let timesteps = dims[1];
-    let vocab_len = dims[2];
+    let (shape, out) = forward(rec, [1, 3, REC_HEIGHT as usize, new_w as usize], data)?;
+    let timesteps = shape[1] as usize;
+    let vocab_len = shape[2] as usize;
 
     let mut text = String::new();
     let mut confidences = Vec::new();
     let mut previous_index = -1_i32;
     for t in 0..timesteps {
+        let row = &out[t * vocab_len..(t + 1) * vocab_len];
         let mut best_index = 0_i32;
         let mut best_value = f32::MIN;
-        for v in 0..vocab_len {
-            let value: f32 = *out.at_3d(0, t, v)?;
+        for (v, &value) in row.iter().enumerate() {
             if value > best_value {
                 best_value = value;
-                best_index = v;
+                best_index = v as i32;
             }
         }
         if best_index != 0

@@ -1,8 +1,10 @@
 use std::sync::Mutex;
 
-use opencv::core::{Point2f, Scalar, Size, Vector};
+use opencv::core::{Point2f, Size, Vec3b, Vector};
 use opencv::prelude::*;
-use opencv::{dnn, geometry, imgcodecs, imgproc};
+use opencv::{imgcodecs, imgproc};
+use ort::session::Session;
+use ort::value::Tensor;
 
 use crate::error::AppError;
 
@@ -23,12 +25,19 @@ pub struct ScanOutput {
     pub orig_height: i32,
 }
 
-/// Wraps the loaded corner-detection network. `dnn::Net` is a handle to
-/// mutable OpenCV state (`forward()` needs `&mut self`), so concurrent
-/// requests share one instance behind a mutex rather than each loading
-/// their own copy — reloading from disk is pure overhead once the weights
-/// are already in memory.
-pub struct DocDetector(Mutex<dnn::Net>);
+/// Wraps the loaded corner-detection network. `Session::run` needs `&mut
+/// self`, so concurrent requests share one instance behind a mutex rather
+/// than each loading their own copy — reloading from disk is pure overhead
+/// once the weights are already in memory.
+///
+/// Runs via `ort` (ONNX Runtime) rather than OpenCV's `dnn` module, because
+/// OpenCV 4.6's ONNX importer cannot load this graph at all: it rejects the
+/// backbone's opset-11-style 3-input `Clip` (`node_proto.input_size() == 1`
+/// assertion) and has no `Einsum` support for the BiFPN neck's 20 weighted
+/// -fusion nodes. `ort` handles both natively, so the model is used exactly
+/// as exported — no graph surgery. `local_ocr.rs` runs its three models the
+/// same way, which lets `opencv` drop the `dnn` feature entirely.
+pub struct DocDetector(Mutex<Session>);
 
 /// DocAligner's `lcnet100` heatmap-regression model (Apache-2.0,
 /// github.com/DocsaidLab/DocAligner): a PP-LCNet-1.0 backbone + BiFPN neck
@@ -56,7 +65,7 @@ const HEATMAP_THRESHOLD: f64 = 0.3;
 
 impl DocDetector {
     pub fn load() -> Result<Self, AppError> {
-        let net = dnn::read_net_from_onnx_def(MODEL_PATH).map_err(AppError::Processing)?;
+        let net = Session::builder()?.commit_from_file(MODEL_PATH)?;
         Ok(Self(Mutex::new(net)))
     }
 
@@ -72,36 +81,39 @@ impl DocDetector {
         // [0,1], no mean/std subtraction (DocAligner's heatmap preprocess
         // is a plain `/255`), BGR->RGB since imdecode gives BGR and the
         // model was trained on RGB.
-        let blob = dnn::blob_from_image(
+        let mut resized_bgr = Mat::default();
+        imgproc::resize(
             image,
-            1.0 / 255.0,
+            &mut resized_bgr,
             Size::new(MODEL_INPUT_SIZE, MODEL_INPUT_SIZE),
-            Scalar::all(0.0),
-            true,
-            false,
-            opencv::core::CV_32F,
+            0.0,
+            0.0,
+            imgproc::INTER_LINEAR,
         )?;
+        let mut resized_rgb = Mat::default();
+        imgproc::cvt_color_def(&resized_bgr, &mut resized_rgb, imgproc::COLOR_BGR2RGB)?;
+        let data = scale_nchw(&resized_rgb)?;
+        let input = Tensor::from_array((
+            [1usize, 3, MODEL_INPUT_SIZE as usize, MODEL_INPUT_SIZE as usize],
+            data,
+        ))?;
 
         let debug = std::env::var("SCAN_DEBUG_TIMING").is_ok();
         let t_fwd = std::time::Instant::now();
-        let mut net = self.0.lock().expect("dnn::Net mutex poisoned");
-        net.set_input(&blob, "img", 1.0, Scalar::all(0.0))?;
-
-        let mut outputs = Vector::<Mat>::new();
-        let names = Vector::<String>::from_iter(["heatmap"]);
-        net.forward(&mut outputs, &names)?;
-        drop(net);
-        if debug {
-            eprintln!("[scan_timing]   detect/forward: {:?}", t_fwd.elapsed());
-        }
-
+        let mut net = self.0.lock().expect("ort Session mutex poisoned");
+        let outputs = net.run(ort::inputs!["img" => input])?;
         // heatmap is [1, 4, H, W] — one channel per corner, in
         // [top-left, top-right, bottom-right, bottom-left] order (verified
         // against a real scan: each channel's peak lands where that corner
         // visually is). Already sigmoid-activated by the exported graph.
-        let heatmap = outputs.get(0)?;
-        let dims = heatmap.mat_size();
-        let (map_h, map_w) = (dims[2], dims[3]);
+        let (shape, heatmap) = outputs["heatmap"].try_extract_tensor::<f32>()?;
+        let (map_h, map_w) = (shape[2] as i32, shape[3] as i32);
+        let heatmap = heatmap.to_vec();
+        drop(outputs);
+        drop(net);
+        if debug {
+            eprintln!("[scan_timing]   detect/forward: {:?}", t_fwd.elapsed());
+        }
 
         let t_post = std::time::Instant::now();
         let mut corners = [Point2f::new(0.0, 0.0); 4];
@@ -121,6 +133,22 @@ impl DocDetector {
     }
 }
 
+/// Packs a resized RGB `u8` `Mat` into an NCHW `f32` tensor, scaled to
+/// `[0,1]` with no mean/std subtraction — DocAligner's heatmap preprocess.
+fn scale_nchw(rgb: &Mat) -> Result<Vec<f32>, AppError> {
+    let rows = rgb.rows();
+    let cols = rgb.cols();
+    let pixels = rgb.data_typed::<Vec3b>()?;
+    let plane = (rows * cols) as usize;
+    let mut out = vec![0f32; 3 * plane];
+    for (index, pixel) in pixels.iter().enumerate() {
+        for channel in 0..3 {
+            out[channel * plane + index] = f32::from(pixel[channel]) / 255.0;
+        }
+    }
+    Ok(out)
+}
+
 /// Extracts channel `channel` of a `[1, 4, H, W]` heatmap tensor, upscales
 /// it to the original image's resolution, thresholds it, and returns the
 /// centroid of its largest connected blob — DocAligner's own
@@ -131,7 +159,7 @@ impl DocDetector {
 /// what avoids reintroducing the same fixed pixel-error the heatmap
 /// architecture exists to avoid.
 fn largest_heatmap_blob_centroid(
-    heatmap: &Mat,
+    heatmap: &[f32],
     channel: usize,
     map_h: i32,
     map_w: i32,
@@ -142,9 +170,8 @@ fn largest_heatmap_blob_centroid(
     // heatmap is a contiguous [1, 4, H, W] tensor fresh off the network, so
     // it can be read as one flat row-major slice and sliced per channel
     // rather than indexed element-by-element.
-    let data = heatmap.data_typed::<f32>()?;
     let start = channel * plane_len;
-    let plane = &data[start..start + plane_len];
+    let plane = &heatmap[start..start + plane_len];
     let plane_mat = Mat::new_rows_cols_with_data(map_h, map_w, plane)?.try_clone()?;
 
     let mut upscaled = Mat::default();
@@ -178,12 +205,12 @@ fn largest_heatmap_blob_centroid(
 
     let mut best: Option<(f64, opencv::core::Moments)> = None;
     for contour in &contours {
-        let area = geometry::contour_area_def(&contour)?;
+        let area = imgproc::contour_area_def(&contour)?;
         if area <= 0.0 {
             continue;
         }
         if best.as_ref().is_none_or(|(best_area, _)| area > *best_area) {
-            let moments = geometry::moments(&contour, false)?;
+            let moments = imgproc::moments(&contour, false)?;
             best = Some((area, moments));
         }
     }
@@ -408,7 +435,7 @@ fn warp_document(image: &Mat, corners: &[Point2f]) -> Result<Mat, AppError> {
         Point2f::new(0.0, (height - 1) as f32),
     ];
 
-    let transform = geometry::get_perspective_transform_slice_def(src, dst)?;
+    let transform = imgproc::get_perspective_transform_slice_def(src, dst)?;
 
     let mut warped = Mat::default();
     imgproc::warp_perspective_def(image, &mut warped, &transform, Size::new(width, height))?;

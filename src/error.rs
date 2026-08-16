@@ -37,11 +37,19 @@ pub enum AppError {
     OcrInputTooLarge,
     #[error("blocking image task failed: {0}")]
     BlockingTask(#[source] tokio::task::JoinError),
+    #[error("ONNX Runtime error: {0}")]
+    Onnx(#[source] ort::Error),
 }
 
 impl From<opencv::Error> for AppError {
     fn from(e: opencv::Error) -> Self {
         AppError::Processing(e)
+    }
+}
+
+impl<R> From<ort::Error<R>> for AppError {
+    fn from(e: ort::Error<R>) -> Self {
+        AppError::Onnx(ort::Error::new_with_code(e.code(), e.message().to_owned()))
     }
 }
 
@@ -64,7 +72,8 @@ impl IntoResponse for AppError {
             | AppError::OcrConfig(_)
             | AppError::OcrUnavailable
             | AppError::OcrInputTooLarge
-            | AppError::BlockingTask(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            | AppError::BlockingTask(_)
+            | AppError::Onnx(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let message = match &self {
             AppError::MissingImage => "no image field found in multipart body",
@@ -83,7 +92,8 @@ impl IntoResponse for AppError {
             | AppError::Io(_)
             | AppError::OcrConfig(_)
             | AppError::OcrInputTooLarge
-            | AppError::BlockingTask(_) => "internal server error",
+            | AppError::BlockingTask(_)
+            | AppError::Onnx(_) => "internal server error",
         };
         if status.is_server_error() {
             tracing::error!(error = ?self, "request failed");
