@@ -1,5 +1,0 @@
-[env]
-LIBCLANG_PATH = "/Library/Developer/CommandLineTools/usr/lib"
-OPENCV_INCLUDE_PATHS = "/opt/homebrew/opt/opencv/include/opencv5"
-OPENCV_LINK_PATHS = "/opt/homebrew/opt/opencv/lib"
-OPENCV_LINK_LIBS = "opencv_core,opencv_imgproc,opencv_imgcodecs,opencv_geometry,opencv_dnn"
