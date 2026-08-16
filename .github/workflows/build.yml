@@ -30,6 +30,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libopencv-dev clang libclang-dev pkg-config build-essential
 
+      - name: Locate libclang
+        run: |
+          libdir="$(dirname "$(find /usr/lib -name 'libclang-*.so*' | head -1)")"
+          echo "LIBCLANG_PATH=$libdir" >> "$GITHUB_ENV"
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
