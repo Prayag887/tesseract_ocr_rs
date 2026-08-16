@@ -35,7 +35,9 @@ jobs:
           found="$(sudo find / -xdev \( -name 'libclang-*.so*' -o -name 'libclang.so*' \) 2>/dev/null | head -1)"
           echo "found: $found"
           test -n "$found"
-          echo "LIBCLANG_PATH=$(dirname "$found")" >> "$GITHUB_ENV"
+          libdir="$(dirname "$found")"
+          echo "LIBCLANG_PATH=$libdir" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$libdir:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
 
