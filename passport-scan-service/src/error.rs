@@ -29,11 +29,19 @@ pub enum AppError {
     MrzNotFound,
     #[error("MRZ checksum validation failed: {0}")]
     MrzChecksum(&'static str),
+    #[error("ONNX Runtime error: {0}")]
+    Onnx(#[source] ort::Error),
 }
 
 impl From<opencv::Error> for AppError {
     fn from(e: opencv::Error) -> Self {
         AppError::Processing(e)
+    }
+}
+
+impl<R> From<ort::Error<R>> for AppError {
+    fn from(e: ort::Error<R>) -> Self {
+        AppError::Onnx(ort::Error::new_with_code(e.code(), e.message().to_owned()))
     }
 }
 
@@ -51,7 +59,8 @@ impl IntoResponse for AppError {
             AppError::Processing(_)
             | AppError::Io(_)
             | AppError::BlockingTask(_)
-            | AppError::OcrWorkerPanicked => StatusCode::INTERNAL_SERVER_ERROR,
+            | AppError::OcrWorkerPanicked
+            | AppError::Onnx(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let message = match &self {
             AppError::MissingImage => "no image field found in multipart body",
@@ -65,7 +74,8 @@ impl IntoResponse for AppError {
             AppError::Processing(_)
             | AppError::Io(_)
             | AppError::BlockingTask(_)
-            | AppError::OcrWorkerPanicked => "internal server error",
+            | AppError::OcrWorkerPanicked
+            | AppError::Onnx(_) => "internal server error",
         };
         if status.is_server_error() {
             tracing::error!(error = ?self, "request failed");

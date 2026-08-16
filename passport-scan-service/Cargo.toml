@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-opencv = { version = "0.100", default-features = false, features = ["imgproc", "imgcodecs", "geometry", "dnn"] }
+opencv = { version = "0.100", default-features = false, features = ["imgproc", "imgcodecs", "geometry"] }
+ort = { version = "2.0.0-rc.13", features = ["download-binaries"] }
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "sync", "time"] }
 tower-http = { version = "0.6", features = ["trace", "limit", "fs", "cors"] }

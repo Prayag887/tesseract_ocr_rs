@@ -4,7 +4,9 @@ use opencv::core::{
     CV_8U, Mat, MatTraitConst, Point, Point2f, Rect, RotatedRect, Scalar, Size, Vec3b, Vector,
 };
 use opencv::prelude::*;
-use opencv::{dnn, geometry, imgcodecs, imgproc};
+use opencv::{geometry, imgcodecs, imgproc};
+use ort::session::Session;
+use ort::value::Tensor;
 
 use serde::Serialize;
 
@@ -86,9 +88,9 @@ pub struct PassportDocument {
 }
 
 pub struct MrzOcrEngine {
-    det: Mutex<dnn::Net>,
-    textline_ori: Mutex<dnn::Net>,
-    rec: Vec<Mutex<dnn::Net>>,
+    det: Mutex<Session>,
+    textline_ori: Mutex<Session>,
+    rec: Vec<Mutex<Session>>,
     rec_vocab: Vec<String>,
     min_confidence: f32,
     orientation_batch_size: usize,
@@ -97,8 +99,8 @@ pub struct MrzOcrEngine {
 
 impl MrzOcrEngine {
     pub fn load() -> Result<Self, AppError> {
-        let det = dnn::read_net_from_onnx_def(DET_MODEL_PATH)?;
-        let textline_ori = dnn::read_net_from_onnx_def(TEXTLINE_ORI_MODEL_PATH)?;
+        let det = Session::builder()?.commit_from_file(DET_MODEL_PATH)?;
+        let textline_ori = Session::builder()?.commit_from_file(TEXTLINE_ORI_MODEL_PATH)?;
         let dict_text = std::fs::read_to_string(REC_DICT_PATH).map_err(AppError::Io)?;
         let mut rec_vocab = Vec::new();
         rec_vocab.push(String::new()); // CTC blank
@@ -120,7 +122,9 @@ impl MrzOcrEngine {
                 .clamp(1, MAX_RECOGNITION_WORKERS);
         let mut rec = Vec::with_capacity(recognition_workers);
         for _ in 0..recognition_workers {
-            rec.push(Mutex::new(dnn::read_net_from_onnx_def(REC_MODEL_PATH)?));
+            rec.push(Mutex::new(
+                Session::builder()?.commit_from_file(REC_MODEL_PATH)?,
+            ));
         }
         tracing::info!(recognition_workers, "OCR recognition workers configured");
 
@@ -368,13 +372,16 @@ fn pad_or_truncate_mrz(text: &str) -> String {
     chars.into_iter().collect()
 }
 
-fn forward(net: &Mutex<dnn::Net>, blob: &Mat) -> Result<Mat, AppError> {
-    let mut net = net.lock().expect("dnn::Net mutex poisoned");
-    net.set_input(blob, NET_INPUT_NAME, 1.0, Scalar::all(0.0))?;
-    let mut outputs = Vector::<Mat>::new();
-    let names = Vector::<String>::from_iter([NET_OUTPUT_NAME]);
-    net.forward(&mut outputs, &names)?;
-    Ok(outputs.get(0)?)
+fn forward(
+    net: &Mutex<Session>,
+    shape: [usize; 4],
+    data: Vec<f32>,
+) -> Result<(Vec<i64>, Vec<f32>), AppError> {
+    let input = Tensor::from_array((shape, data))?;
+    let mut net = net.lock().expect("ort Session mutex poisoned");
+    let outputs = net.run(ort::inputs![NET_INPUT_NAME => input])?;
+    let (out_shape, out_data) = outputs[NET_OUTPUT_NAME].try_extract_tensor::<f32>()?;
+    Ok((out_shape.to_vec(), out_data.to_vec()))
 }
 
 fn imagenet_nchw(rgb: &Mat) -> Result<Vec<f32>, AppError> {
@@ -390,10 +397,6 @@ fn imagenet_nchw(rgb: &Mat) -> Result<Vec<f32>, AppError> {
         }
     }
     Ok(out)
-}
-
-fn nchw_blob(sizes: &[i32], data: &[f32]) -> Result<Mat, AppError> {
-    Ok(Mat::new_nd_with_data(sizes, data)?.try_clone()?)
 }
 
 fn det_resize_dims(height: i32, width: i32) -> (i32, i32) {
@@ -412,7 +415,7 @@ fn det_resize_dims(height: i32, width: i32) -> (i32, i32) {
     (round32(resize_h), round32(resize_w))
 }
 
-fn detect_text_boxes(det: &Mutex<dnn::Net>, image: &Mat) -> Result<Vec<[Point2f; 4]>, AppError> {
+fn detect_text_boxes(det: &Mutex<Session>, image: &Mat) -> Result<Vec<[Point2f; 4]>, AppError> {
     let size = image.size()?;
     let (orig_w, orig_h) = (size.width, size.height);
     let (resize_h, resize_w) = det_resize_dims(orig_h, orig_w);
@@ -430,9 +433,8 @@ fn detect_text_boxes(det: &Mutex<dnn::Net>, image: &Mat) -> Result<Vec<[Point2f;
     imgproc::cvt_color_def(&resized_bgr, &mut resized_rgb, imgproc::COLOR_BGR2RGB)?;
 
     let data = imagenet_nchw(&resized_rgb)?;
-    let blob = nchw_blob(&[1, 3, resize_h, resize_w], &data)?;
-    let prob_map = forward(det, &blob)?;
-    let prob_2d: Mat = prob_map.reshape(1, resize_h)?.try_clone()?;
+    let (_shape, prob_data) = forward(det, [1, 3, resize_h as usize, resize_w as usize], data)?;
+    let prob_2d: Mat = Mat::new_rows_cols_with_data(resize_h, resize_w, &prob_data)?.try_clone()?;
 
     let mut binary = Mat::default();
     imgproc::threshold(
@@ -590,7 +592,7 @@ fn crop_quad(image: &Mat, corners: &[Point2f; 4]) -> Result<Mat, AppError> {
 }
 
 fn classify_and_fix_rotation_batch(
-    textline_ori: &Mutex<dnn::Net>,
+    textline_ori: &Mutex<Session>,
     mut crops: Vec<Mat>,
     batch_size: usize,
 ) -> Result<Vec<Mat>, AppError> {
@@ -611,20 +613,20 @@ fn classify_and_fix_rotation_batch(
             imgproc::cvt_color_def(&resized, &mut rgb, imgproc::COLOR_BGR2RGB)?;
             data.extend(imagenet_nchw(&rgb)?);
         }
-        let blob = nchw_blob(
-            &[
-                chunk.len() as i32,
+        let (_shape, out) = forward(
+            textline_ori,
+            [
+                chunk.len(),
                 3,
-                TEXTLINE_ORI_HEIGHT,
-                TEXTLINE_ORI_WIDTH,
+                TEXTLINE_ORI_HEIGHT as usize,
+                TEXTLINE_ORI_WIDTH as usize,
             ],
-            &data,
+            data,
         )?;
-        let out = forward(textline_ori, &blob)?;
 
         for (index, crop) in chunk.iter_mut().enumerate() {
-            let upright: f32 = *out.at_2d(index as i32, 0)?;
-            let flipped: f32 = *out.at_2d(index as i32, 1)?;
+            let upright = out[index * 2];
+            let flipped = out[index * 2 + 1];
             if flipped > upright {
                 let mut rotated = Mat::default();
                 opencv::core::flip(crop, &mut rotated, -1)?;
@@ -636,7 +638,7 @@ fn classify_and_fix_rotation_batch(
 }
 
 fn recognize_lines_parallel(
-    recognizers: &[Mutex<dnn::Net>],
+    recognizers: &[Mutex<Session>],
     vocab: &[String],
     crops: &[Mat],
     batch_size: usize,
@@ -664,7 +666,7 @@ fn recognize_lines_parallel(
 }
 
 fn recognize_lines_batch(
-    rec: &Mutex<dnn::Net>,
+    rec: &Mutex<Session>,
     vocab: &[String],
     crops: &[Mat],
     batch_size: usize,
@@ -713,11 +715,14 @@ fn recognize_lines_batch(
                 }
             }
         }
-        let blob = nchw_blob(&[group.len() as i32, 3, REC_HEIGHT, padded_width], &data)?;
-        let out = forward(rec, &blob)?;
+        let (shape, out) = forward(
+            rec,
+            [group.len(), 3, REC_HEIGHT as usize, padded_width as usize],
+            data,
+        )?;
         for (batch_index, &(crop_index, width)) in group.iter().enumerate() {
             recognized[crop_index] =
-                decode_recognition(&out, batch_index as i32, width, padded_width, vocab)?;
+                decode_recognition(&out, &shape, batch_index, width, padded_width, vocab)?;
         }
         start = end;
     }
@@ -725,28 +730,31 @@ fn recognize_lines_batch(
 }
 
 fn decode_recognition(
-    out: &Mat,
-    batch_index: i32,
+    out: &[f32],
+    shape: &[i64],
+    batch_index: usize,
     valid_width: i32,
     padded_width: i32,
     vocab: &[String],
 ) -> Result<(String, f32), AppError> {
-    let dims = out.mat_size();
-    let timesteps = ((dims[1] * valid_width + padded_width - 1) / padded_width).clamp(1, dims[1]);
-    let vocab_len = dims[2];
+    let full_timesteps = shape[1] as usize;
+    let vocab_len = shape[2] as usize;
+    let timesteps = (((full_timesteps as i32) * valid_width + padded_width - 1) / padded_width)
+        .clamp(1, full_timesteps as i32) as usize;
+    let batch_offset = batch_index * full_timesteps * vocab_len;
 
     let mut text = String::new();
     let mut confidence_sum = 0.0_f32;
     let mut confidence_count = 0_usize;
     let mut previous_index = -1_i32;
     for t in 0..timesteps {
+        let row = &out[batch_offset + t * vocab_len..batch_offset + (t + 1) * vocab_len];
         let mut best_index = 0_i32;
         let mut best_value = f32::MIN;
-        for v in 0..vocab_len {
-            let value: f32 = *out.at_3d(batch_index, t, v)?;
+        for (v, &value) in row.iter().enumerate() {
             if value > best_value {
                 best_value = value;
-                best_index = v;
+                best_index = v as i32;
             }
         }
         if best_index != 0
