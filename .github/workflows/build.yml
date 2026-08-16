@@ -1,0 +1,43 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [prod, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        crate: [., passport-scan-service]
+    defaults:
+      run:
+        working-directory: ${{ matrix.crate }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report OS/toolchain
+        run: |
+          lsb_release -a || cat /etc/os-release
+          gcc --version
+          g++ --version
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libopencv-dev clang libclang-dev pkg-config build-essential
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.crate }}
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Test (release)
+        run: cargo test --release
