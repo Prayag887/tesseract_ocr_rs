@@ -1,0 +1,102 @@
+# Two independent services, one container each — no shared runtime between
+# them (see static/index.html: only the frontend is shared). Each builds from
+# its own Dockerfile and its own build context, so neither can see the other's
+# sources.
+#
+# An nginx `gateway` fronts both so the UI lives on ONE host port while the two
+# APIs stay separate, path-routed exactly as in production:
+#
+#   http://localhost:3002/           -> the UI
+#   http://localhost:3002/nid/       -> nid-scan-service      (prefix stripped)
+#   http://localhost:3002/passport/  -> passport-scan-service (prefix stripped)
+#
+# The backends are deliberately NOT published to the host: one forwarded port
+# reaches everything, which is the whole point. To hit a backend directly for
+# debugging, add a `ports:` entry back, or go through the gateway prefix.
+#
+# NOTE: both Dockerfiles build OpenCV 5.0.0 from source, so the first
+# `docker compose build` takes a long time (tens of minutes each, and they are
+# built independently — no layer sharing between the two contexts).
+
+services:
+  gateway:
+    image: nginx:1.27-alpine
+    container_name: ocr-gateway
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_HOST_PORT:-3002}:80"
+    volumes:
+      # Mount the DIRECTORY, not the single .conf file. A single-file bind
+      # mount pins one inode, so any editor that writes-and-renames (most of
+      # them) leaves the container serving the original file forever, with no
+      # error to say so. Mounting the dir also shadows the image's stock
+      # default.conf, which would otherwise also try to listen on 80.
+      - ./nginx:/etc/nginx/conf.d:ro
+    depends_on:
+      # Both images define a HEALTHCHECK, so the gateway waits until each
+      # backend actually answers /health rather than merely having started —
+      # model loading takes a few seconds after the process is up.
+      nid-scan-service:
+        condition: service_healthy
+      passport-scan-service:
+        condition: service_healthy
+
+  nid-scan-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ocr-nid-scan-service:latest
+    container_name: nid-scan-service
+    restart: unless-stopped
+    # Reached only via the gateway, at /nid/. Listens on the image's default
+    # PORT=3000 inside the compose network.
+    expose:
+      - "3000"
+    environment:
+      # `local` = in-process ONNX (default). `paddlex` = legacy HTTP sidecar,
+      # which also needs PADDLE_OCR_URL pointing at a reachable PaddleX service.
+      OCR_BACKEND: "${OCR_BACKEND:-local}"
+      PADDLE_OCR_MIN_CONFIDENCE: "${PADDLE_OCR_MIN_CONFIDENCE:-0.45}"
+      # glibc gives each thread its own malloc arena (up to 8 x nproc), and
+      # OpenCV's dnn allocates large short-lived buffers from all of them, so
+      # freed memory ends up stranded across arenas instead of reused.
+      # Capping at 2 measured ~35 MB lower RSS with no latency change.
+      MALLOC_ARENA_MAX: "2"
+      # Set to any value to log every recognized OCR line at INFO level.
+      # OCR_DEBUG_LINES: "1"
+      # SCAN_DEBUG_TIMING: "1"
+      # See the passport service below for what tower_http=debug buys you.
+      RUST_LOG: "${RUST_LOG:-info,tower_http=debug}"
+    volumes:
+      # Crops written by /scan and served back from /scanned_document. Keep
+      # them out of the container layer so they survive a recreate.
+      - nid-scanned-documents:/app/scanned_document
+    # HEALTHCHECK is defined in the image; not repeated here.
+
+  passport-scan-service:
+    build:
+      context: ./passport-scan-service
+      dockerfile: Dockerfile
+    image: ocr-passport-scan-service:latest
+    container_name: passport-scan-service
+    restart: unless-stopped
+    # Reached only via the gateway, at /passport/.
+    expose:
+      - "3003"
+    environment:
+      MRZ_OCR_MIN_CONFIDENCE: "${MRZ_OCR_MIN_CONFIDENCE:-0.45}"
+      # See the nid service above.
+      MALLOC_ARENA_MAX: "2"
+      # OCR_DEBUG_LINES: "1"
+      # OCR_DEBUG_TIMING: "1"
+      # SCAN_DEBUG_TIMING: "1"
+      # tower_http=debug makes TraceLayer log every request/response, which
+      # is what shows whether a browser call is reaching the container at all.
+      # Drop back to plain "info" (or set RUST_LOG in the env) to quiet it.
+      RUST_LOG: "${RUST_LOG:-info,tower_http=debug}"
+    volumes:
+      - passport-scanned-documents:/app/scanned_document
+
+volumes:
+  nid-scanned-documents:
+  passport-scanned-documents:

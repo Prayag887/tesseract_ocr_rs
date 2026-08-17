@@ -384,22 +384,21 @@ const modelBadgeEl = document.getElementById('modelBadge');
 
 // Two independent microservices (NID: Devanagari label/value parsing;
 // Passport: MRZ fixed-column + checksum decode) with no shared runtime —
-// only the frontend is shared, switching which origin/path it talks to.
-// In production both sit behind one nginx host, path-routed
-// (ocr.aieynora.xyz/nid/, ocr.aieynora.xyz/passport/, prefix stripped
-// before reaching each backend) — same-origin relative paths there, no
-// CORS involved. Local dev has no nginx in front, so each service is its
-// own origin/port instead.
-const IS_PROD = location.hostname === 'ocr.aieynora.xyz';
+// only the frontend is shared, switching which path it talks to.
+// Both APIs are reached through one nginx host, path-routed (/nid/,
+// /passport/, prefix stripped before reaching each backend): production is
+// ocr.aieynora.xyz, local dev is the `gateway` service in docker-compose.yml.
+// So these are same-origin relative paths in both environments — the UI is
+// served from a single port and no CORS is involved.
 const SERVICES = {
   nid: {
-    base: IS_PROD ? '/nid' : 'http://localhost:3002',
+    base: '/nid',
     badge: 'PP-OCRv5 · Devanagari',
     subtitle: 'Upload a Nepali national ID or citizenship card, confirm the crop, and receive structured label and value pairs.',
     extractingMessage: 'Reading label and value pairs with PP-OCRv5…',
   },
   passport: {
-    base: IS_PROD ? '/passport' : 'http://localhost:3003',
+    base: '/passport',
     badge: 'PP-OCRv5 · MRZ',
     subtitle: 'Upload a passport photo page, confirm the crop, and receive the decoded, checksum-verified MRZ.',
     extractingMessage: 'Reading the machine-readable zone with PP-OCRv5…',

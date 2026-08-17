@@ -5,7 +5,12 @@
 # than shared, matching this service's standalone-repo-style isolation.
 # See that file for why OpenCV is built from source and why
 # .cargo/config.toml (macOS/homebrew-specific) is not copied in.
-FROM rust:1-bookworm AS builder
+# NOTE: trixie (not bookworm) is required. `ort`'s download-binaries feature
+# fetches a prebuilt libonnxruntime that references __isoc23_* (glibc >= 2.38)
+# and libstdc++'s _M_replace_cold (GCC >= 13); bookworm ships glibc 2.36 /
+# GCC 12, so linking fails there with undefined-symbol errors. Trixie is
+# glibc 2.41 / GCC 14. CI hits this too, which is why it runs ubuntu-latest.
+FROM rust:1-trixie AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake ninja-build git pkg-config \
@@ -39,7 +44,7 @@ COPY src ./src
 RUN cargo build --release
 
 ########## Stage 2: runtime ##########
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libjpeg62-turbo-dev libpng-dev libtiff-dev libwebp-dev libopenexr-dev \

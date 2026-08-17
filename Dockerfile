@@ -6,7 +6,12 @@
 # .cargo/config.toml's OPENCV_* env, which is macOS/homebrew-specific and
 # deliberately NOT copied into this image — pkg-config against the OpenCV
 # built below is used instead).
-FROM rust:1-bookworm AS builder
+# NOTE: trixie (not bookworm) is required. `ort`'s download-binaries feature
+# fetches a prebuilt libonnxruntime that references __isoc23_* (glibc >= 2.38)
+# and libstdc++'s _M_replace_cold (GCC >= 13); bookworm ships glibc 2.36 /
+# GCC 12, so linking fails there with undefined-symbol errors. Trixie is
+# glibc 2.41 / GCC 14. CI hits this too, which is why it runs ubuntu-latest.
+FROM rust:1-trixie AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake ninja-build git pkg-config \
@@ -50,10 +55,10 @@ COPY models ./models
 RUN cargo build --release
 
 ########## Stage 2: runtime ##########
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 
 # -dev packages (not just the runtime .so) so apt resolves the exact
-# correct versioned runtime library from bookworm's archive itself, rather
+# correct versioned runtime library from trixie's archive itself, rather
 # than this Dockerfile guessing a version-suffixed package name (e.g.
 # libavcodec59) that can drift out from under a fixed Dockerfile.
 RUN apt-get update && apt-get install -y --no-install-recommends \
