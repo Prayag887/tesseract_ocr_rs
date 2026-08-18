@@ -27,6 +27,135 @@ pub struct OcrLine {
     pub polygon: [[i32; 2]; 4],
 }
 
+/// Sorts detected lines into reading order (top-to-bottom rows, left-to-
+/// right within a row) in place. Every label/value pairing in this module
+/// — `block_between`'s "label starts the block", `nearest_value_near`'s
+/// same-row-then-below search — assumes the lines arrive in this order;
+/// nothing upstream (detection, recognition) actually guarantees it, they
+/// just hand back boxes in whatever order the model happened to propose
+/// them. Confirmed on a real scan where this bit: "Birth Place:" and its
+/// same-row value "District: Panchthar" came back with the *value*
+/// listed first, because that box's detected top edge sat a few pixels
+/// above the label box's — enough to invert a naive sort-by-top, even
+/// though the two are visually on the same line. `block_between` then
+/// started the birth-place block one line late, after the row it needed,
+/// so the real birth district fell outside it and a *different* row's
+/// district (the permanent address's) fell inside it instead.
+///
+/// Plain sort-by-top can't fix this — it's the same bug. Rows are found
+/// by clustering: two boxes belong to the same row if their vertical
+/// spans overlap at all, not by comparing single top coordinates.
+///
+/// Each row is anchored to the *first* (topmost) box assigned to it, and
+/// every later candidate is tested against that one anchor — not against
+/// the row's current envelope. Tested against the envelope first and it
+/// chains: box B overlaps anchor A, so B joins and the envelope grows to
+/// cover both; box C only overlaps the *new, taller* envelope, not A
+/// itself, so C joins too; repeat. On a real scan with five stacked
+/// label rows spaced tightly enough that each row's box just brushed the
+/// next, every label in the form's left column chained into a single
+/// "row" that swallowed the whole column, so all five labels sorted
+/// before any of their values — exactly the label/value inversion this
+/// function exists to prevent, just at a larger scale.
+pub fn sort_reading_order(lines: &mut Vec<OcrLine>) {
+    let mut indexed: Vec<(usize, Bounds)> =
+        lines.iter().enumerate().map(|(index, line)| (index, Bounds::from_line(line))).collect();
+    indexed.sort_by_key(|(_, bounds)| bounds.top);
+
+    let mut rows: Vec<(Bounds, Vec<(usize, Bounds)>)> = Vec::new();
+    for entry in indexed {
+        let (_, bounds) = entry;
+        match rows.last_mut() {
+            Some((anchor, row)) if bounds.top < anchor.bottom && anchor.top < bounds.bottom => {
+                row.push(entry);
+            }
+            _ => rows.push((bounds, vec![entry])),
+        }
+    }
+    let rows: Vec<Vec<(usize, Bounds)>> = rows.into_iter().map(|(_, row)| row).collect();
+
+    let originals: Vec<OcrLine> = lines.drain(..).collect();
+    for mut row in rows {
+        row.sort_by_key(|(_, bounds)| bounds.left);
+        lines.extend(merge_adjacent(&originals, &row));
+    }
+}
+
+/// Rejoins boxes the detector split mid-phrase, so one printed line comes
+/// back as one `OcrLine`. Two boxes merge when the horizontal gap between
+/// them is under `WORD_GAP_RATIO` of the row's text height — ordinary word
+/// spacing — and stay separate beyond that, which is where this form's
+/// label and value columns sit.
+///
+/// Needed because detection granularity isn't stable across preprocessing:
+/// on an upscaled crop the detector starts emitting one box *per word*
+/// ("प्रयाग" and "ढकाल" separately, "नाम"/"थर" separately) where the same
+/// card at native resolution gave one box per line. Every label in this
+/// module is matched as a contiguous string, so a label split across two
+/// boxes ("नाम थर" becoming "नाम" + "थर") stops matching entirely — and
+/// the value that belongs to it lands in a third box with nothing left to
+/// tie it to. Confirmed on a real scan: the whole front page extracted
+/// zero fields with word-split detection despite the recognizer reading
+/// every character on it correctly.
+fn merge_adjacent(originals: &[OcrLine], row: &[(usize, Bounds)]) -> Vec<OcrLine> {
+    /// Fraction of text height a gap may span and still count as a space
+    /// between words of one phrase rather than a column break. Tuned down
+    /// from 1.0 against real scans: at 1.0 this form's label and value
+    /// columns merged into one line, which let a field's search run past
+    /// its own column and take the *next* one's value ("Citizenship
+    /// Certificate No." merged with the "Sex: Male" beside it and returned
+    /// `citizenship_number: "Male"`). Ordinary word spacing sits well
+    /// under half the text height, so 0.5 keeps phrases joined while
+    /// leaving columns apart.
+    const WORD_GAP_RATIO: f32 = 0.5;
+
+    /// How far two boxes' vertical centres may sit apart, as a fraction of
+    /// the smaller box's height, and still count as the same printed line.
+    /// The row grouping that feeds this function deliberately accepts *any*
+    /// vertical overlap, which is right for ordering but far too loose for
+    /// merging: it put the back page's preamble sentence in the same group
+    /// as the label row beneath it (their boxes overlap by a few pixels),
+    /// and merging on gap alone then produced "Citizenship Certificate
+    /// No.: Government of Nepal has issued this... 65-01-77-02872" as a
+    /// single line. Comparing centres instead of overlap keeps stacked
+    /// rows apart no matter how much their boxes bleed into each other.
+    const BASELINE_TOLERANCE: f32 = 0.4;
+
+    let same_line = |a: Bounds, b: Bounds| {
+        let centre_gap = ((a.top + a.bottom) - (b.top + b.bottom)).abs() as f32 / 2.0;
+        centre_gap <= a.height().min(b.height()) as f32 * BASELINE_TOLERANCE
+    };
+
+    let mut merged: Vec<OcrLine> = Vec::new();
+    let mut pending: Option<(String, f32, Bounds)> = None;
+
+    for &(index, bounds) in row {
+        let line = &originals[index];
+        match pending.take() {
+            Some((text, confidence, group))
+                if same_line(group, bounds)
+                    && (bounds.left - group.right) as f32
+                        <= group.height().min(bounds.height()) as f32 * WORD_GAP_RATIO =>
+            {
+                pending = Some((
+                    format!("{text} {}", line.text),
+                    confidence.min(line.confidence),
+                    group.union(bounds),
+                ));
+            }
+            Some((text, confidence, group)) => {
+                merged.push(OcrLine { text, confidence, polygon: group.to_polygon() });
+                pending = Some((line.text.clone(), line.confidence, bounds));
+            }
+            None => pending = Some((line.text.clone(), line.confidence, bounds)),
+        }
+    }
+    if let Some((text, confidence, group)) = pending {
+        merged.push(OcrLine { text, confidence, polygon: group.to_polygon() });
+    }
+    merged
+}
+
 /// Internal-only label/value pair for OCR text that didn't map to a named
 /// field — never part of the public API response (see module docs); kept
 /// only to log for debugging via `OCR_DEBUG_LINES`.
@@ -50,30 +179,88 @@ pub struct CitizenshipDocument {
     /// text, so a downstream consumer can match against those three
     /// literal values instead of every spelling variant a scan might read.
     pub gender: Option<String>,
-    /// ISO 8601 (YYYY-MM-DD), Gregorian — from the back page's `Year:`/
-    /// `Month:`/`Day:` rows.
+    /// `YYYY/MM/DD`, Gregorian — from the back page's `Year:`/`Month:`/
+    /// `Day:` rows. Not ISO 8601 (`-`-separated); `/`-separated per the
+    /// same convention as every other date field in this schema.
     pub date_of_birth_ad: Option<String>,
-    /// `YYYY-MM-DD` in the Bikram Sambat calendar (not converted to AD) —
+    /// `YYYY/MM/DD` in the Bikram Sambat calendar (not converted to AD) —
     /// from the front page's `साल`/`महिना`/`गते` rows.
     pub date_of_birth_bs: Option<String>,
     pub birth_district: Option<String>,
-    pub birth_municipality: Option<String>,
+    /// The local body plus its *type*, as one string — "Aarubote VDC",
+    /// "Urlabari Municipality", "badhaiyatal Rural Municipality". The type
+    /// lives in the printed label rather than the value ("VDC : Aarubote"),
+    /// so a bare "Aarubote" would silently lose which kind of local body it
+    /// is — and cards issued before and after Nepal's 2017 local
+    /// restructuring use different types for the same address, so it isn't
+    /// derivable from the name alone.
+    pub birth_municipal: Option<String>,
     pub birth_ward: Option<String>,
     pub permanent_district: Option<String>,
-    pub permanent_municipality: Option<String>,
+    /// See [`CitizenshipDocument::birth_municipal`].
+    pub permanent_municipal: Option<String>,
     pub permanent_ward: Option<String>,
     pub father_name: Option<String>,
     pub mother_name: Option<String>,
     pub spouse_name: Option<String>,
     /// वंशज / जन्म / अंगीकृत / वैवाहिक अंगीकृत, as printed.
     pub citizenship_type: Option<String>,
-    /// `YYYY-MM-DD` in Bikram Sambat, as printed.
+    /// `YYYY/MM/DD` in Bikram Sambat, as printed.
     pub date_of_issue_bs: Option<String>,
 }
 
 const MONTH_ABBREVIATIONS: &[&str] = &[
     "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
 ];
+
+/// Every local-body label this form is known to print, paired with the
+/// canonical English type name to append to the value — see
+/// [`CitizenshipDocument::birth_municipal`] for why the type has to be
+/// carried into the value at all.
+///
+/// Order is load-bearing, longest/most-specific first: several of these
+/// are substrings of each other ("न.पा" inside "म.न.पा" and "उ.म.न.पा";
+/// "Municipality" inside "Rural Municipality"; "Metropolitan" inside
+/// "Sub-Metropolitan"), so a shorter spelling tried first would match a
+/// longer label's tail and mislabel a metropolitan city as a plain
+/// municipality — while still extracting the right *name*, which makes it
+/// exactly the kind of wrong that reads as correct.
+const LOCAL_BODY_LABELS: &[(&str, &str)] = &[
+    ("उ.म.न.पा", "Sub-Metropolitan City"),
+    ("म.न.पा", "Metropolitan City"),
+    ("गा.वि.स", "VDC"),
+    ("गा.पा", "Rural Municipality"),
+    ("न.पा", "Municipality"),
+    ("Sub-Metropolitan", "Sub-Metropolitan City"),
+    ("Metropolitan", "Metropolitan City"),
+    ("Rural Municipality", "Rural Municipality"),
+    ("VDC", "VDC"),
+    ("Municipality", "Municipality"),
+    ("R. M", "Rural Municipality"),
+    ("R.M", "Rural Municipality"),
+];
+
+/// Finds whichever local-body label `block` prints and returns its value
+/// with the body type appended ("Aarubote" under a "VDC :" label becomes
+/// `"Aarubote VDC"`).
+fn local_body_in(block: &[OcrLine]) -> Option<String> {
+    for (keyword, type_name) in LOCAL_BODY_LABELS {
+        let Some(value) = value_after_keyword(block, keyword, &["वडा", "Ward"]) else { continue };
+        let value = value.trim();
+        // The label matched but its value didn't survive extraction — keep
+        // looking rather than returning a bare type name with no place
+        // attached to it. Checked on the *name alone*, before the type is
+        // appended: a one-character misread ("ल") becomes a comfortably
+        // long "ल Municipality" once suffixed, which then sails through
+        // every downstream length check that would otherwise have caught
+        // it. No real place name here is a single character.
+        if value.chars().count() < 2 {
+            continue;
+        }
+        return Some(format!("{value} {type_name}"));
+    }
+    None
+}
 
 /// The form's literal placeholder for "not applicable" (an unmarried
 /// holder's spouse name/number) — not a real value.
@@ -82,24 +269,58 @@ const NOT_APPLICABLE: &str = "XXX";
 pub fn extract(lines: &[OcrLine]) -> CitizenshipDocument {
     let mut doc = CitizenshipDocument::default();
 
-    doc.citizenship_number = value_after_keyword(lines, "ना.प्र.नं", &[])
-        .or_else(|| value_after_keyword(lines, "Citizenship Certificate No", &[]))
-        .map(|v| devanagari_digits_to_ascii(v.trim()));
-
     // "नाम थर" (the holder's own name) is also a substring of "बाबुको नाम
     // थर", "आमाको नाम थर", and "...को नामथर" (father/mother/spouse) — if
     // the holder's own line goes undetected (confirmed with a real scan:
     // one detection box spanned "आमाको नाम थर: फुलमाया अधिकारी : ना.प्र.नं:
     // ..." as a single line), the plain keyword search below would find
-    // and attribute a *relative's* name instead. Scope the owner-only
-    // searches (name, sex) to lines that aren't themselves one of those
-    // relatives' rows, rather than trusting reading order alone to put the
-    // holder's own row first.
-    let owner_lines: Vec<OcrLine> = lines
+    // and attribute a *relative's* name instead. "ना.प्र.नं" (citizenship
+    // number) has the identical problem — it's the same label reused for
+    // the holder's own number and both parents' — so scope every
+    // owner-only search (number, name, sex) to lines that aren't
+    // themselves one of those relatives' rows, rather than trusting
+    // reading order alone to put the holder's own row first.
+    //
+    // Fuzzy, not exact — this is a defensive exclusion, so a false exclude
+    // just means the search tries another line (safe), while a false
+    // *include* is the actual bug it exists to prevent. Confirmed on a real
+    // scan: "बाबुको" (father's-name marker) misread as "बाबको" (missing a
+    // vowel sign) slipped past an exact `.contains` check, leaving that
+    // line in `owner_lines`; the fuzzy "नाम थर" search then matched inside
+    // it and attributed the father's name as the holder's own.
+    //
+    // Truncates at the first relative marker rather than filtering out
+    // only the lines that literally contain one — confirmed on the same
+    // scan that a relative's *own* "ना.प्र.नं" (citizenship number) label
+    // sits on its own detection box, separate from the "बाबुको नाम थर" box
+    // that names whose section it's in. A per-line content filter can't
+    // catch that box at all; it has no relative marker in its own text.
+    // The form's layout always puts the holder's own fields first, then
+    // father's, then mother's, then spouse's — so everything from the
+    // first relative marker onward is fair game to drop, not just lines
+    // that happen to mention one.
+    //
+    let owner_end = lines
         .iter()
-        .filter(|line| !["बाबुको", "आमाको", "पति"].iter().any(|kw| line.text.contains(kw)))
-        .cloned()
-        .collect();
+        .position(|line| ["बाबुको", "आमाको", "पति"].iter().any(|kw| contains_keyword(&line.text, kw)))
+        .unwrap_or(lines.len());
+    let owner_lines: Vec<OcrLine> = lines[..owner_end].to_vec();
+
+    // "ना.प्र.न" (no final anusvara) is tried after the full spelling as a
+    // second chance, not instead of it: the recognizer drops or doubles a
+    // character in this label often enough that the full form lands at
+    // distance 2 and stops matching (a real scan read it as "नान.प्र.न.",
+    // one inserted "न" *and* a "ं"->"." swap). The shorter form absorbs one
+    // of those two errors into its own missing character, bringing the
+    // same line back within distance 1.
+    // Stop keywords are the labels printed immediately to the right of the
+    // number on each layout — without them, a row that merged across the
+    // column gap carries the neighbour's "Sex: Male" into this field.
+    const NUMBER_STOPS: &[&str] = &["Sex", "Ser", "लिङ्ग", "Full Name", "नाम थर"];
+    doc.citizenship_number = value_after_keyword(&owner_lines, "ना.प्र.नं", NUMBER_STOPS)
+        .or_else(|| value_after_keyword(&owner_lines, "ना.प्र.न", NUMBER_STOPS))
+        .or_else(|| value_after_keyword(&owner_lines, "Citizenship Certificate No", NUMBER_STOPS))
+        .map(|v| devanagari_digits_to_ascii(v.trim()));
 
     let full_name_english =
         value_after_keyword(&owner_lines, "Full Name", &[]).map(|v| v.trim_end_matches('.').trim().to_owned());
@@ -125,45 +346,75 @@ pub fn extract(lines: &[OcrLine]) -> CitizenshipDocument {
     let bs_month = devanagari_number_after(lines, "महिना");
     let bs_day = devanagari_number_after(lines, "गते");
     doc.date_of_birth_bs = match (bs_year, bs_month, bs_day) {
-        (Some(y), Some(m), Some(d)) => Some(format!("{y}-{m:0>2}-{d:0>2}")),
-        _ => None,
+        (Some(y), Some(m), Some(d)) => Some(format!("{y}/{m:0>2}/{d:0>2}")),
+        // The three parts print on one row ("साल: २०५६ महिना: ०७ गते: २३"),
+        // so when only the day's label is the one that got mangled — "गते"
+        // read as "वत्ते" on a real scan, too far off for fuzzy matching —
+        // the digits are all still there in reading order. Falling back to
+        // "year, month, day are the three numbers on the साल row" recovers
+        // the whole date instead of dropping it for one bad label.
+        _ => bs_date_from_row(lines),
     };
 
-    let birth_block_devanagari = block_between(lines, "जन्म स्थान", &["स्थायी बासस्थान", "स्थायी ठेगाना"]);
+    // The short "स्थान"/"बासस्थान" spellings are fallbacks for when the
+    // recognizer mangles the leading word of a block header badly enough
+    // that even fuzzy matching misses it — a real scan read "जन्म स्थान"
+    // as a bare "स्थान" (the "जन्म" landed in its own box) and "स्थायी
+    // बासस्थान" as "्यायी बासस्थान". Losing a *block* header is much more
+    // damaging than losing one label: every field inside the block goes
+    // null at once, which is exactly what happened (district, local body
+    // and ward all empty on a page where the recognizer had read each of
+    // them perfectly).
+    //
+    // Safe despite "स्थान" also being a substring of "बासस्थान": the form
+    // always prints birth place above permanent address, `block_between`
+    // starts at the *first* match, and the permanent header is listed as
+    // this block's end keyword — so the birth block still stops where the
+    // permanent one begins.
+    let birth_block_devanagari = block_between(lines, "जन्म स्थान", &["स्थायी बासस्थान", "स्थायी ठेगाना"])
+        .none_if_empty()
+        .or_else(|| block_between(lines, "स्थान", &["बासस्थान", "ठेगाना"]).none_if_empty())
+        .unwrap_or(&[]);
     let birth_block_english = block_between(lines, "Birth Place", &["Permanent Address"]);
     let birth_block = if birth_block_devanagari.is_empty() { birth_block_english } else { birth_block_devanagari };
     doc.birth_district = value_after_keyword(birth_block, "जिल्ला", &[])
         .or_else(|| value_after_keyword(birth_block, "District", &[]));
-    doc.birth_municipality = value_after_keyword(birth_block, "गा.पा", &["वडा"])
-        .or_else(|| value_after_keyword(birth_block, "न.पा", &["वडा"]))
-        .or_else(|| value_after_keyword(birth_block, "R. M", &["Ward"]))
-        .or_else(|| value_after_keyword(birth_block, "R.M", &["Ward"]));
+    doc.birth_municipal = local_body_in(birth_block);
     doc.birth_ward = value_after_keyword(birth_block, "वडा", &[])
         .or_else(|| value_after_keyword(birth_block, "Ward", &[]))
-        .map(|v| devanagari_digits_to_ascii(v.trim()))
-        .filter(|v| is_plausible_ward_number(v));
+        .and_then(|v| ward_number(&v));
 
+    // "बासस्थान" alone as a last resort — same reasoning as the birth
+    // block's "स्थान" fallback above.
     let permanent_block_devanagari = block_between(lines, "स्थायी बासस्थान", &["जन्म मिति", "बाबुको"])
         .none_if_empty()
-        .or_else(|| block_between(lines, "स्थायी ठेगाना", &["जन्म मिति", "बाबुको"]).none_if_empty());
+        .or_else(|| block_between(lines, "स्थायी ठेगाना", &["जन्म मिति", "बाबुको"]).none_if_empty())
+        .or_else(|| block_between(lines, "बासस्थान", &["जन्म मिति", "बाबुको"]).none_if_empty());
     let permanent_block_english = block_between(lines, "Permanent Address", &["नागरिकता", "Citizenship Type"]);
     let permanent_block = permanent_block_devanagari.unwrap_or(&[]);
     let permanent_block = if permanent_block.is_empty() { permanent_block_english } else { permanent_block };
     doc.permanent_district = value_after_keyword(permanent_block, "जिल्ला", &[])
         .or_else(|| value_after_keyword(permanent_block, "District", &[]));
-    doc.permanent_municipality = value_after_keyword(permanent_block, "गा.पा", &["वडा"])
-        .or_else(|| value_after_keyword(permanent_block, "न.पा", &["वडा"]))
-        .or_else(|| value_after_keyword(permanent_block, "R. M", &["Ward"]))
-        .or_else(|| value_after_keyword(permanent_block, "R.M", &["Ward"]));
+    doc.permanent_municipal = local_body_in(permanent_block);
     doc.permanent_ward = value_after_keyword(permanent_block, "वडा", &[])
         .or_else(|| value_after_keyword(permanent_block, "Ward", &[]))
-        .map(|v| devanagari_digits_to_ascii(v.trim()))
-        .filter(|v| is_plausible_ward_number(v));
+        .and_then(|v| ward_number(&v));
 
-    let father_block = block_between(lines, "बाबुको नाम थर", &["आमाको नाम थर"]);
+    // The bare "बाबुको"/"आमाको" fallbacks cover the same split-header case
+    // as the address blocks above: a real scan put "बाबुको" in its own
+    // detection box with "नाम थर" in the next one, so the full header
+    // never appeared on any single line and the father block came back
+    // empty even though his name was read perfectly two boxes later.
+    let father_block = block_between(lines, "बाबुको नाम थर", &["आमाको नाम थर"])
+        .none_if_empty()
+        .or_else(|| block_between(lines, "बाबुको", &["आमाको"]).none_if_empty())
+        .unwrap_or(&[]);
     doc.father_name = value_after_keyword(father_block, "नाम थर", &["ना.प्र.नं", "ना.कि"]);
 
-    let mother_block = block_between(lines, "आमाको नाम थर", &["पति", "पत्नी"]);
+    let mother_block = block_between(lines, "आमाको नाम थर", &["पति", "पत्नी"])
+        .none_if_empty()
+        .or_else(|| block_between(lines, "आमाको", &["पति", "पत्नी"]).none_if_empty())
+        .unwrap_or(&[]);
     doc.mother_name = value_after_keyword(mother_block, "नाम थर", &["ना.प्र.नं", "ना.कि"]);
 
     let spouse_block = block_between(lines, "पति", &[]);
@@ -188,7 +439,7 @@ pub fn extract(lines: &[OcrLine]) -> CitizenshipDocument {
     // "जारी मिति : ..." line itself is read fine.
     doc.date_of_issue_bs = value_after_keyword(officer_block, "जारी मिति", &[])
         .or_else(|| value_after_keyword(lines, "जारी मिति", &[]))
-        .map(|v| devanagari_digits_to_ascii(v.trim()));
+        .and_then(|v| parse_bs_date(v.trim()));
 
     // Never part of the response (see `Field`'s doc comment) — logged only,
     // so a scan that's coming back thinner than expected can still be
@@ -227,9 +478,9 @@ fn normalize_gender(raw: &str) -> Option<String> {
 fn sanitize(mut doc: CitizenshipDocument) -> CitizenshipDocument {
     doc.full_name = clean_text(doc.full_name);
     doc.birth_district = clean_text(doc.birth_district);
-    doc.birth_municipality = clean_text(doc.birth_municipality);
+    doc.birth_municipal = clean_text(doc.birth_municipal);
     doc.permanent_district = clean_text(doc.permanent_district);
-    doc.permanent_municipality = clean_text(doc.permanent_municipality);
+    doc.permanent_municipal = clean_text(doc.permanent_municipal);
     doc.father_name = clean_text(doc.father_name);
     doc.mother_name = clean_text(doc.mother_name);
     doc.spouse_name = clean_text(doc.spouse_name);
@@ -240,7 +491,20 @@ fn sanitize(mut doc: CitizenshipDocument) -> CitizenshipDocument {
 fn clean_text(value: Option<String>) -> Option<String> {
     value.filter(|text| {
         let trimmed = text.trim();
-        !trimmed.is_empty() && trimmed.chars().any(char::is_alphabetic)
+        // Rust's `is_alphabetic` follows Unicode's derived Alphabetic
+        // property, which — unlike a plain "is this a letter" check —
+        // includes Devanagari's combining vowel signs and visarga, since
+        // they're needed to form a complete syllable together with a base
+        // consonant. That's correct for the property's own purpose, but
+        // means a single stray combining mark like "ः" (visarga alone,
+        // detached from any base character — confirmed on a real scan
+        // where it survived as `mother_name`) passes an any-alphabetic
+        // check on its own. Requiring at least 2 characters is a cheap
+        // way to reject that without depending on a full Unicode
+        // General-Category table this project doesn't otherwise need —
+        // no real name/place/type value in this schema is ever one
+        // character long.
+        trimmed.chars().count() >= 2 && trimmed.chars().any(char::is_alphabetic)
     })
 }
 
@@ -254,10 +518,10 @@ pub fn combine(front: &CitizenshipDocument, back: &CitizenshipDocument) -> Citiz
         date_of_birth_ad: back.date_of_birth_ad.clone().or_else(|| front.date_of_birth_ad.clone()),
         date_of_birth_bs: front.date_of_birth_bs.clone().or_else(|| back.date_of_birth_bs.clone()),
         birth_district: back.birth_district.clone().or_else(|| front.birth_district.clone()),
-        birth_municipality: back.birth_municipality.clone().or_else(|| front.birth_municipality.clone()),
+        birth_municipal: back.birth_municipal.clone().or_else(|| front.birth_municipal.clone()),
         birth_ward: back.birth_ward.clone().or_else(|| front.birth_ward.clone()),
         permanent_district: back.permanent_district.clone().or_else(|| front.permanent_district.clone()),
-        permanent_municipality: back.permanent_municipality.clone().or_else(|| front.permanent_municipality.clone()),
+        permanent_municipal: back.permanent_municipal.clone().or_else(|| front.permanent_municipal.clone()),
         permanent_ward: back.permanent_ward.clone().or_else(|| front.permanent_ward.clone()),
         father_name: front.father_name.clone().or_else(|| back.father_name.clone()),
         mother_name: front.mother_name.clone().or_else(|| back.mother_name.clone()),
@@ -275,7 +539,7 @@ fn combine_ad_date(year: Option<String>, month: Option<String>, day: Option<Stri
     if !(1..=31).contains(&day) {
         return None;
     }
-    Some(format!("{year:04}-{month_num:02}-{day:02}"))
+    Some(format!("{year:04}/{month_num:02}/{day:02}"))
 }
 
 fn devanagari_digits_to_ascii(text: &str) -> String {
@@ -294,6 +558,43 @@ fn devanagari_digits_to_ascii(text: &str) -> String {
             other => other,
         })
         .collect()
+}
+
+/// Recovers a BS birth date from the row that carries it, using position
+/// instead of labels: the "साल"/"महिना"/"गते" row prints exactly three
+/// numbers in year-month-day order, so when one of the three labels is too
+/// mangled to match, the digits themselves are still unambiguous. Requires
+/// exactly three numbers on the row and a 4-digit year, so a row that
+/// picked up an extra number from a neighbouring column is rejected rather
+/// than silently reordered into a wrong date.
+fn bs_date_from_row(lines: &[OcrLine]) -> Option<String> {
+    let row = lines.iter().find(|line| contains_keyword(&line.text, "साल"))?;
+    let converted = devanagari_digits_to_ascii(&row.text);
+    let numbers: Vec<&str> = converted
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .collect();
+    let [year, month, day] = numbers.as_slice() else { return None };
+    if year.len() != 4 {
+        return None;
+    }
+    Some(format!("{year}/{month:0>2}/{day:0>2}"))
+}
+
+/// Parses a Bikram Sambat date's digits out of raw OCR text and reformats
+/// as `YYYY/MM/DD` — deliberately not just digit-converting and passing
+/// the source punctuation through, since the recognizer doesn't read the
+/// separator reliably: "जारी मिति : २०७३-०१-०५" has come back with a
+/// period substituted for one of the dashes ("2073.01-05"), which a
+/// caller then has no consistent way to parse. Extracting exactly the 8
+/// digits (4 for year, 2 each for month/day) and discarding whatever
+/// separator surrounded them sidesteps that misread entirely.
+fn parse_bs_date(text: &str) -> Option<String> {
+    let digits: String = devanagari_digits_to_ascii(text).chars().filter(char::is_ascii_digit).collect();
+    if digits.len() != 8 {
+        return None;
+    }
+    Some(format!("{}/{}/{}", &digits[0..4], &digits[4..6], &digits[6..8]))
 }
 
 /// Finds `keyword` and returns the text after *its own* colon — scoped to
@@ -321,11 +622,143 @@ fn devanagari_digits_to_ascii(text: &str) -> String {
 /// "65-01-77-02872" in two entirely separate boxes rather than one merged
 /// string, which the same-line-only check above can't see at all. Both
 /// paths were needed on real scans, not just one.
-fn value_after_keyword(lines: &[OcrLine], keyword: &str, stop_keywords: &[&str]) -> Option<String> {
+/// Standard Levenshtein distance (character-level, not byte-level — matters
+/// for Devanagari, where one visible glyph is often 3 UTF-8 bytes).
+fn edit_distance(a: &[char], b: &[char]) -> usize {
+    let (n, m) = (a.len(), b.len());
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut curr = vec![0usize; m + 1];
+    for i in 1..=n {
+        curr[0] = i;
+        for j in 1..=m {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[m]
+}
+
+/// Extra chars of match-window slack reserved purely for spurious
+/// whitespace the recognizer inserts mid-word — since those cost nothing
+/// against `max_distance` (see `find_keyword`), the window has to be able
+/// to grow past `keyword.len() + max_distance` to actually capture them.
+/// Sized generously: a real scan produced "Citize ns hip" for
+/// "Citizenship", three extra spaces inside one 12-character word.
+const WHITESPACE_SLACK: usize = 6;
+
+/// Finds `keyword` in `text` allowing up to `max_distance` character-level
+/// errors, *not counting whitespace*. Returns the byte range `[start, end)`
+/// of the best match, so the caller can slice `text` after it same as an
+/// exact match would.
+///
+/// Whitespace is stripped from both sides before the edit distance is
+/// computed — real scans routinely split a label across stray spaces
+/// ("Citize nship", "Permane nt", "Dis trict") often more than one per
+/// word, and charging those against the same one-error budget as a genuine
+/// wrong letter meant most of them were never going to fit. A dropped or
+/// inserted space changes nothing about which word was printed, so it
+/// isn't a meaningful error to tolerate for — it's closer to noise than to
+/// a typo.
+fn find_keyword(text: &str, keyword: &str, max_distance: usize) -> Option<(usize, usize)> {
+    let keyword_chars: Vec<char> = keyword.chars().filter(|c| !c.is_whitespace()).collect();
+    let text_chars: Vec<char> = text.chars().collect();
+    let klen = keyword_chars.len();
+    if klen == 0 {
+        return None;
+    }
+    let min_window = klen.saturating_sub(max_distance).max(1);
+    let max_window = klen + max_distance + WHITESPACE_SLACK;
+
+    // Real single-character typos are overwhelmingly substitutions (same
+    // length as the keyword), not insertions/deletions — confirmed against
+    // a real scan: "R.M" (the municipality-label keyword) against a line
+    // OCR'd as "R.N." found *two* equally-scored distance-1 candidates,
+    // "R." (a 2-char window, keyword with "M" deleted) and "R.N" (a 3-char
+    // window, "M"->"N" substituted). Preferring whichever was found first
+    // picked the deletion match, leaving "N." dangling off the end of the
+    // keyword instead of the label, and "N." then got read as the field's
+    // *value*. Break ties toward the window closest to the keyword's own
+    // length so the substitution reading wins. Ties are compared against
+    // `klen` (the whitespace-stripped length) for the same reason the
+    // window itself now needs the slack above: a window padded out with
+    // free whitespace is not actually "further" from the keyword.
+    let mut best: Option<(usize, usize, usize)> = None;
+    for start in 0..text_chars.len() {
+        for window in min_window..=max_window {
+            let end = start + window;
+            if end > text_chars.len() {
+                break;
+            }
+            let stripped: Vec<char> =
+                text_chars[start..end].iter().filter(|c| !c.is_whitespace()).copied().collect();
+            let distance = edit_distance(&stripped, &keyword_chars);
+            if distance > max_distance {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some((_, _, best_distance)) if distance < best_distance => true,
+                Some((best_start, best_end, best_distance)) if distance == best_distance => {
+                    let best_window = best_end - best_start;
+                    window.abs_diff(klen) < best_window.abs_diff(klen)
+                }
+                _ => false,
+            };
+            if better {
+                best = Some((start, end, distance));
+            }
+        }
+    }
+
+    best.map(|(start, end, _)| {
+        let byte_start: usize = text_chars[..start].iter().map(|c| c.len_utf8()).sum();
+        let byte_end: usize = text_chars[..end].iter().map(|c| c.len_utf8()).sum();
+        (byte_start, byte_end)
+    })
+}
+
+/// `find_keyword`, but at a distance chosen by the keyword's own length
+/// rather than passed in by the caller — under 4 characters stays exact
+/// (distance 0), everything else allows one error (distance 1). Below 4
+/// characters a single edit is too cheap relative to the keyword's own
+/// length to mean anything: confirmed on a real scan that "पति" (3 chars,
+/// the spouse-name marker) fuzzy-matches "पत" inside "प्रमाणपत्र"
+/// ("...Certificate", part of the certificate's own printed title,
+/// present on every scan) at distance 1. Shared by every caller that
+/// tests "does this line contain roughly this keyword" rather than
+/// extracting a value after it — `block_between`'s start/end markers and
+/// the owner/relative-row split both need the identical safety margin
+/// `value_after_keyword` gets from its own length-independent tolerance,
+/// and re-deriving the threshold separately at each call site is how it
+/// would drift out of sync.
+fn contains_keyword(text: &str, keyword: &str) -> bool {
+    let max_distance = if keyword.chars().count() < 4 { 0 } else { 1 };
+    find_keyword(text, keyword, max_distance).is_some()
+}
+
+/// `value_after_keyword`'s search, run once per `max_distance` — see that
+/// function's doc comment for why exact matches always win over fuzzy ones
+/// across the *whole* document, not just within one line.
+fn value_after_keyword_pass(
+    lines: &[OcrLine],
+    keyword: &str,
+    stop_keywords: &[&str],
+    max_distance: usize,
+) -> Option<String> {
     for (index, line) in lines.iter().enumerate() {
         let text = &line.text;
-        let Some(kw_pos) = text.find(keyword) else { continue };
-        let after_kw = &text[kw_pos + keyword.len()..];
+        // A line that's itself the certificate's own boilerplate can never
+        // be a real field label — skip it as a match candidate entirely
+        // rather than relying on the extracted value happening to fail
+        // the same noise check afterward. Matters once fuzzy tolerance is
+        // loose enough that a boilerplate sentence can score close to a
+        // real (but badly misread) label — see NOISE_PHRASES.
+        if looks_like_noise(text) {
+            continue;
+        }
+        let Some((_start, kw_end)) = find_keyword(text, keyword, max_distance) else { continue };
+        let after_kw = &text[kw_end..];
         let stop_pos = stop_keywords.iter().filter_map(|kw| after_kw.find(kw)).min().unwrap_or(after_kw.len());
         let scope = &after_kw[..stop_pos];
         let value = match scope.find(':') {
@@ -341,6 +774,43 @@ fn value_after_keyword(lines: &[OcrLine], keyword: &str, stop_keywords: &[&str])
         }
     }
     None
+}
+
+/// Finds `keyword`'s value the same way the rest of this module always
+/// has (exact substring, same-line or nearest-neighbor) — but if that
+/// finds nothing *anywhere in the document*, retries with progressively
+/// more character-level error tolerance in the keyword match (1, then 2).
+/// The recognizer routinely mangles an otherwise-correct label —
+/// confirmed against real scans: "Citizenship" read as "Citize nship" (one
+/// inserted space) and, worse, as "Citize ns hip Certificate No." (two
+/// inserted spaces); "Year" as "Ycar"/"Yenr"; "District" as
+/// "Distriet"/missing its final "t" — and an exact-substring match treats
+/// each of those as if the label were never printed at all, even though
+/// the value sitting right next to it was read correctly.
+///
+/// Each tolerance level is tried across *every* line before the next
+/// (looser) level is tried on *any* line — not per-line — because a short
+/// keyword's fuzzy match can land on an unrelated word at the same edit
+/// distance as a real typo: searching for "Day" fuzzy-matched "Dat" in
+/// "Date of Birth (AD): ..." (distance 1, identical to "Year"~"Ycar"'s
+/// real fix) on a line that happened to come before the genuine "Day:09"
+/// line, stealing the field. Requiring no distance-1 match to exist
+/// *anywhere* before distance-2 is allowed *anywhere* (and so on) means
+/// the real, closer match always wins that race. `value_after_keyword_pass`
+/// also refuses to match a line that's the certificate's own boilerplate
+/// (see `looks_like_noise`) — needed once tolerance reaches 2, since by
+/// then a long keyword can score close against a long *wrong* sentence
+/// that happens to share most of its words.
+fn value_after_keyword(lines: &[OcrLine], keyword: &str, stop_keywords: &[&str]) -> Option<String> {
+    // Tried a third tier at distance 2 (to catch e.g. "Citize ns hip
+    // Certificate No.", two inserted spaces) — reverted. Tested against
+    // five real scans and it introduced more new wrong-value regressions
+    // (permanent_district/birth_municipal matching the wrong block on
+    // scans that were correct at distance-1) than the one field it fixed.
+    // Distance 1 stays the ceiling until a fix can raise it without that
+    // trade — the noise-line pre-filter and the distance-1 fuzzy pass
+    // below still apply either way.
+    (0..=1).find_map(|max_distance| value_after_keyword_pass(lines, keyword, stop_keywords, max_distance))
 }
 
 /// Substrings from the certificate's own repeating background watermark
@@ -371,6 +841,12 @@ const NOISE_PHRASES: &[&str] = &[
     "जिल्ला प्रशासन",
     "कार्यालयमा वा प्रहरी कार्यालयमा",
     "बुझाईदिनुहोला",
+    // The back page's fixed English preamble sentence — never a field
+    // label or value, but "...issued this Citizenship Certificate with
+    // following details" shares enough of "Citizenship Certificate No"
+    // that it's a real fuzzy-match risk for that keyword specifically.
+    "issued this",
+    "following details",
 ];
 
 fn looks_like_noise(text: &str) -> bool {
@@ -383,6 +859,57 @@ fn looks_like_noise(text: &str) -> bool {
 /// because *some* text followed the "वडा"/"Ward" keyword.
 fn is_plausible_ward_number(text: &str) -> bool {
     !text.is_empty() && text.len() <= 2 && text.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Pulls the ward digits out of whatever followed the "वडा"/"Ward"
+/// keyword. The label's own abbreviation often has no colon after it
+/// ("वडा नं. २", "Ward No.2"), so the remainder still carries "नं."/"No."
+/// ahead of the number and fails a plain digits-only check — while the
+/// digits themselves are perfectly readable. Keeping only the digits and
+/// then applying [`is_plausible_ward_number`] recovers those without
+/// loosening what counts as a valid ward.
+fn ward_number(value: &str) -> Option<String> {
+    // The label's own abbreviation has to come off *before* the
+    // lookalike mapping below, not after: "No" ends in an "o", which that
+    // mapping turns into a zero, so "Ward No.2" came out as "02" — a
+    // plausible-looking two-digit ward that is simply wrong.
+    let value = devanagari_digits_to_ascii(value);
+    let value = value.replace("No", "").replace("no", "").replace("नं", "");
+
+    // A ward value is a single short token once the label and its
+    // punctuation are gone. Requiring that *before* the lookalike mapping
+    // below is what keeps the mapping honest: it only ever runs on
+    // something already shaped like a ward number, never on leftover
+    // prose. Without this the fuzzy label search — which matched "Ward"
+    // against "Bard" inside "District: Bardiya", one edit away — handed
+    // "iya" to the mapping, whose "i"->1 rule turned a district name into
+    // a confident, completely wrong ward of "1".
+    let core: String = value.chars().filter(|c| c.is_alphanumeric()).collect();
+    if core.is_empty() || core.chars().count() > 2 {
+        return None;
+    }
+
+    // Letters that are visually the same glyph as a digit in this form's
+    // print, mapped back. Confirmed on real scans: "Ward No.1" read as
+    // "Ward No.l" and "Ward No.5" as "Ward No.S", both of which otherwise
+    // leave the field empty despite the number being perfectly legible.
+    // Only safe *because* a ward is digits-only — the same substitution
+    // applied to a name or place would corrupt real letters, so it stays
+    // scoped to this one field rather than living in a shared cleanup.
+    let digits: String = core
+        .chars()
+        .map(|c| match c {
+            'l' | 'I' | 'i' | '|' => '1',
+            'O' | 'o' | 'D' => '0',
+            'S' | 's' => '5',
+            'Z' | 'z' => '2',
+            'B' => '8',
+            'G' => '6',
+            other => other,
+        })
+        .filter(char::is_ascii_digit)
+        .collect();
+    is_plausible_ward_number(&digits).then_some(digits)
 }
 
 /// Same as [`value_after_keyword`], but the caller only wants the leading
@@ -417,13 +944,18 @@ fn devanagari_number_after(lines: &[OcrLine], keyword: &str) -> Option<String> {
 /// keyword search (e.g. "ना.प्र.नं") to one section of the document when
 /// the same label text is printed more than once (father's vs. mother's
 /// citizenship number).
+/// Fuzzy for the same reason `value_after_keyword` is — confirmed on a
+/// real scan that an exact-only version of this function missed
+/// "Permanent Address" entirely because it read as "Permane nt Address:"
+/// (one inserted space), silently emptying the whole permanent-address
+/// block and every field sourced from it, not just one misread value.
 fn block_between<'a>(lines: &'a [OcrLine], start_keyword: &str, end_keywords: &[&str]) -> &'a [OcrLine] {
-    let Some(start) = lines.iter().position(|line| line.text.contains(start_keyword)) else {
+    let Some(start) = lines.iter().position(|line| contains_keyword(&line.text, start_keyword)) else {
         return &[];
     };
     let end = lines[start + 1..]
         .iter()
-        .position(|line| end_keywords.iter().any(|kw| line.text.contains(kw)))
+        .position(|line| end_keywords.iter().any(|kw| contains_keyword(&line.text, kw)))
         .map(|offset| start + 1 + offset)
         .unwrap_or(lines.len());
     &lines[start..end]
@@ -685,6 +1217,28 @@ impl Bounds {
     fn height(self) -> i32 {
         self.bottom.saturating_sub(self.top).max(1)
     }
+
+    /// Smallest box covering both — the merged bounds of two boxes joined
+    /// into one line (see `merge_adjacent`).
+    fn union(self, other: Self) -> Self {
+        Self {
+            left: self.left.min(other.left),
+            top: self.top.min(other.top),
+            right: self.right.max(other.right),
+            bottom: self.bottom.max(other.bottom),
+        }
+    }
+
+    /// Back to an `OcrLine` polygon, corners in the same clockwise-from-
+    /// top-left order the detector emits.
+    fn to_polygon(self) -> [[i32; 2]; 4] {
+        [
+            [self.left, self.top],
+            [self.right, self.top],
+            [self.right, self.bottom],
+            [self.left, self.bottom],
+        ]
+    }
 }
 
 fn group_bounds(lines: &[OcrLine], indexes: &[usize]) -> Bounds {
@@ -833,12 +1387,12 @@ mod tests {
         assert_eq!(doc.citizenship_number.as_deref(), Some("65-01-77-02872"));
         assert_eq!(doc.full_name.as_deref(), Some("युबिन अधिकारी"));
         assert_eq!(doc.gender.as_deref(), Some("Male"));
-        assert_eq!(doc.date_of_birth_bs.as_deref(), Some("2060-10-26"));
+        assert_eq!(doc.date_of_birth_bs.as_deref(), Some("2060/10/26"));
         assert_eq!(doc.birth_district.as_deref(), Some("बर्दिया"));
-        assert_eq!(doc.birth_municipality.as_deref(), Some("बढैयाताल"));
+        assert_eq!(doc.birth_municipal.as_deref(), Some("बढैयाताल Rural Municipality"));
         assert_eq!(doc.birth_ward.as_deref(), Some("2"));
         assert_eq!(doc.permanent_district.as_deref(), Some("बर्दिया"));
-        assert_eq!(doc.permanent_municipality.as_deref(), Some("बढैयाताल"));
+        assert_eq!(doc.permanent_municipal.as_deref(), Some("बढैयाताल Rural Municipality"));
         assert_eq!(doc.permanent_ward.as_deref(), Some("2"));
         assert_eq!(doc.father_name.as_deref(), Some("रामजी प्रसाद अधिकारी"));
         assert_eq!(doc.mother_name.as_deref(), Some("फुलमाया अधिकारी"));
@@ -854,15 +1408,15 @@ mod tests {
         assert_eq!(doc.citizenship_number.as_deref(), Some("65-01-77-02872"));
         assert_eq!(doc.full_name.as_deref(), Some("YUBIN ADHIKARI"));
         assert_eq!(doc.gender.as_deref(), Some("Male"));
-        assert_eq!(doc.date_of_birth_ad.as_deref(), Some("2004-02-09"));
+        assert_eq!(doc.date_of_birth_ad.as_deref(), Some("2004/02/09"));
         assert_eq!(doc.birth_district.as_deref(), Some("Bardiya"));
-        assert_eq!(doc.birth_municipality.as_deref(), Some("badhaiyatal"));
+        assert_eq!(doc.birth_municipal.as_deref(), Some("badhaiyatal Rural Municipality"));
         assert_eq!(doc.birth_ward.as_deref(), Some("2"));
         assert_eq!(doc.permanent_district.as_deref(), Some("Bardiya"));
-        assert_eq!(doc.permanent_municipality.as_deref(), Some("badhaiyatal"));
+        assert_eq!(doc.permanent_municipal.as_deref(), Some("badhaiyatal Rural Municipality"));
         assert_eq!(doc.permanent_ward.as_deref(), Some("2"));
         assert_eq!(doc.citizenship_type.as_deref(), Some("वंशज"));
-        assert_eq!(doc.date_of_issue_bs.as_deref(), Some("2077-08-07"));
+        assert_eq!(doc.date_of_issue_bs.as_deref(), Some("2077/08/07"));
     }
 
     #[test]
@@ -874,8 +1428,8 @@ mod tests {
         assert_eq!(combined.citizenship_number.as_deref(), Some("65-01-77-02872"));
         assert_eq!(combined.full_name.as_deref(), Some("YUBIN ADHIKARI"));
         assert_eq!(combined.gender.as_deref(), Some("Male"));
-        assert_eq!(combined.date_of_birth_ad.as_deref(), Some("2004-02-09"));
-        assert_eq!(combined.date_of_birth_bs.as_deref(), Some("2060-10-26"));
+        assert_eq!(combined.date_of_birth_ad.as_deref(), Some("2004/02/09"));
+        assert_eq!(combined.date_of_birth_bs.as_deref(), Some("2060/10/26"));
         assert_eq!(combined.father_name.as_deref(), Some("रामजी प्रसाद अधिकारी"));
         assert_eq!(combined.mother_name.as_deref(), Some("फुलमाया अधिकारी"));
     }

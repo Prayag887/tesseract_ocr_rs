@@ -17,8 +17,6 @@ pub enum AppError {
     Processing(#[source] opencv::Error),
     #[error("invalid crop: {0}")]
     InvalidCrop(&'static str),
-    #[error("failed to persist scanned image: {0}")]
-    Io(#[source] std::io::Error),
     #[error("multipart error: {0}")]
     Multipart(#[from] axum::extract::multipart::MultipartError),
     #[error("blocking image task failed: {0}")]
@@ -50,7 +48,6 @@ impl IntoResponse for AppError {
             AppError::NotFound => StatusCode::NOT_FOUND,
             AppError::Multipart(_) => StatusCode::BAD_REQUEST,
             AppError::Processing(_)
-            | AppError::Io(_)
             | AppError::BlockingTask(_)
             | AppError::OcrWorkerPanicked
             | AppError::Onnx(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -63,7 +60,6 @@ impl IntoResponse for AppError {
             AppError::InvalidCrop(message) => message,
             AppError::Multipart(_) => "invalid multipart upload",
             AppError::Processing(_)
-            | AppError::Io(_)
             | AppError::BlockingTask(_)
             | AppError::OcrWorkerPanicked
             | AppError::Onnx(_) => "internal server error",

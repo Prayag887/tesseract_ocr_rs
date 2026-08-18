@@ -1,9 +1,12 @@
+mod binarize;
+mod docshadow;
 mod error;
 mod fields;
 mod local_ocr;
 mod preprocess;
 mod routes;
 mod scanner;
+mod upscale;
 
 use std::sync::Arc;
 
@@ -38,12 +41,7 @@ async fn main() {
         .clamp(1, 64);
     tracing::info!(max_concurrency, "image-processing concurrency configured");
 
-    let state = Arc::new(AppState {
-        output_dir: output_dir.clone(),
-        detector,
-        ocr,
-        processing_permits: tokio::sync::Semaphore::new(max_concurrency),
-    });
+    let state = Arc::new(AppState::new(detector, ocr, tokio::sync::Semaphore::new(max_concurrency)));
 
     let app = Router::new()
         .route("/health", get(routes::health))

@@ -8,9 +8,12 @@ use opencv::{geometry, imgcodecs, imgproc};
 use ort::session::Session;
 use ort::value::Tensor;
 
+use crate::binarize;
+use crate::docshadow;
 use crate::error::AppError;
 use crate::fields::{self, CitizenshipDocument, OcrLine};
 use crate::preprocess;
+use crate::upscale;
 
 // Detection is script-agnostic (unlike recognition, which has no larger
 // Devanagari model available — see fields.rs/local_ocr.rs history), so it's
@@ -90,6 +93,24 @@ pub struct LocalOcrEngine {
     /// — kept configurable in case a particular scan reads better without
     /// it (e.g. an already-clean, non-watermarked photocopy).
     preprocess_enabled: bool,
+    /// `None` only when explicitly disabled with
+    /// `CITIZENSHIP_OCR_DOCSHADOW=false` — see
+    /// `docshadow.rs`. Runs first in the optional-pipeline order (crop ->
+    /// docshadow -> upscale -> binarize -> detect): shadow/illumination
+    /// cleanup is meant to feed a *cleaner* image into upscaling, not the
+    /// other way around.
+    docshadow: Option<Mutex<Session>>,
+    /// `None` only when explicitly disabled with
+    /// `CITIZENSHIP_OCR_UPSCALE=false` — see `upscale.rs`.
+    upscale: Option<Mutex<Session>>,
+    /// Off by default even when upscaling is on — see `binarize.rs`'s
+    /// module doc. Tested against a real scan both ways (inverted and
+    /// not): both made recognition *worse* than the plain upscaled color
+    /// image, introducing several garbage-string lines the color image
+    /// didn't have. Kept as its own flag, not folded into the upscale
+    /// path, specifically so it stays testable without dragging upscale's
+    /// results down by default.
+    binarize_enabled: bool,
     /// Where the OCR-input debug image gets written (see `extract_blocking`)
     /// — not the crop/original, which callers don't need kept around at all.
     output_dir: std::path::PathBuf,
@@ -130,6 +151,29 @@ impl LocalOcrEngine {
             .and_then(|value| value.parse::<bool>().ok())
             .unwrap_or(true);
 
+        let docshadow_enabled = std::env::var("CITIZENSHIP_OCR_DOCSHADOW")
+            .ok()
+            .and_then(|value| value.parse::<bool>().ok())
+            .unwrap_or(true);
+        let docshadow = if docshadow_enabled {
+            Some(Mutex::new(Session::builder()?.commit_from_file(docshadow::DOCSHADOW_MODEL_PATH)?))
+        } else {
+            None
+        };
+        let upscale_enabled = std::env::var("CITIZENSHIP_OCR_UPSCALE")
+            .ok()
+            .and_then(|value| value.parse::<bool>().ok())
+            .unwrap_or(true);
+        let upscale = if upscale_enabled {
+            Some(Mutex::new(Session::builder()?.commit_from_file(upscale::UPSCALE_MODEL_PATH)?))
+        } else {
+            None
+        };
+        let binarize_enabled = std::env::var("CITIZENSHIP_OCR_BINARIZE")
+            .ok()
+            .and_then(|value| value.parse::<bool>().ok())
+            .unwrap_or(false);
+
         Ok(Self {
             det: Mutex::new(det),
             textline_ori: Mutex::new(textline_ori),
@@ -139,6 +183,9 @@ impl LocalOcrEngine {
             orientation_batch_size,
             recognition_batch_size,
             preprocess_enabled,
+            docshadow,
+            upscale,
+            binarize_enabled,
             output_dir,
         })
     }
@@ -157,7 +204,7 @@ impl LocalOcrEngine {
         let debug = std::env::var("OCR_DEBUG_TIMING").is_ok();
         let t0 = std::time::Instant::now();
         let buf = Vector::<u8>::from_slice(image);
-        let bgr = imgcodecs::imdecode(&buf, imgcodecs::IMREAD_COLOR).map_err(AppError::Decode)?;
+        let mut bgr = imgcodecs::imdecode(&buf, imgcodecs::IMREAD_COLOR).map_err(AppError::Decode)?;
         if bgr.empty() {
             return Err(AppError::EmptyImage);
         }
@@ -170,53 +217,94 @@ impl LocalOcrEngine {
         let mut params = Vector::<i32>::new();
         params.push(imgcodecs::IMWRITE_JPEG_QUALITY);
         params.push(90);
-
-        let crop_size = bgr.size()?;
-        let short_side = crop_size.width.min(crop_size.height);
-
-        // Citizenship certificates are printed on watermarked security
-        // paper and are usually photographed under uneven light, not
-        // flatbed-scanned — cleaning that up before text detection runs
-        // genuinely helps a washed-out, faint-ink photo (the detector
-        // otherwise picks up the watermark's edges as noise and the
-        // recognizer loses contrast against it). But confirmed against a
-        // second real scan — a sharp, well-lit photo whose crop came out
-        // much smaller (under 650px on the short side, against 900px+ for
-        // every crop the pipeline was tuned against) — the *same* adaptive
-        // threshold instead wiped out whole strokes and made that photo
-        // read as near-total garbage where the raw crop read cleanly. The
-        // morphological close and median blur steps below use fixed pixel
-        // sizes (a 2x2 kernel, a 3px blur): sized sensibly against a
-        // 900px+ crop's stroke widths, but oversized relative to a
-        // sub-650px crop's much thinner strokes, so they erode signal
-        // instead of just noise there. Below MIN_PREPROCESS_SHORT_SIDE,
-        // skip the whole pipeline rather than run it a second, gentler way
-        // that hasn't been validated against a real scan — recognizing
-        // that a photo this small has too little margin for it. Tried
-        // instead first: running both variants and keeping whichever
-        // extraction had more populated fields — confirmed against the
-        // first real scan that this is unsound, since it once preferred a
-        // result with a swapped birth/permanent ward and a garbage
-        // `issuing_district_office` value simply because it had more
-        // non-null fields than the correct-but-sparser one.
-        let cleaned = if self.preprocess_enabled && short_side >= MIN_PREPROCESS_SHORT_SIDE {
-            let t_pre = std::time::Instant::now();
-            let cleaned = preprocess::denoise_for_ocr(&bgr)?;
-            if debug {
-                eprintln!("[ocr_timing] preprocess: {:?}", t_pre.elapsed());
+        let dump = |image: &Mat, name: &str| {
+            let mut bytes = Vector::<u8>::new();
+            if imgcodecs::imencode(".jpg", image, &mut bytes, &params).is_ok() {
+                let _ = std::fs::write(self.output_dir.join(format!("{name}_{side_name}.jpg")), bytes.as_slice());
             }
-            cleaned
+        };
+
+        // Runs before upscale/binarize/preprocess, on the crop straight out
+        // of scanner.rs — shadow/illumination cleanup is meant to hand a
+        // clearer image to whatever runs next, not the other way around.
+        if let Some(session) = &self.docshadow {
+            let t_shadow = std::time::Instant::now();
+            bgr = docshadow::remove_shadow(session, &bgr)?;
+            if debug {
+                eprintln!("[ocr_timing] docshadow: {:?}", t_shadow.elapsed());
+            }
+            dump(&bgr, "docshadow");
+        }
+
+        // Upscale+binarize (see upscale.rs/binarize.rs) and the old
+        // adaptive-threshold preprocess (see preprocess.rs) are
+        // alternative strategies for the same problem — a crop that reads
+        // poorly as-is — not a pipeline to chain: binarizing an
+        // already-binarized image is pointless, and the two were tuned
+        // against different failure modes (uneven lighting/watermark vs. a
+        // too-small crop). Upscale wins when both are configured, since
+        // it's the one actually under active testing right now.
+        let cleaned = if let Some(session) = &self.upscale {
+            let t_up = std::time::Instant::now();
+            let upscaled = upscale::upscale_3x(session, &bgr)?;
+            if debug {
+                eprintln!("[ocr_timing] upscale: {:?}", t_up.elapsed());
+            }
+            dump(&upscaled, "upscaled");
+
+            if self.binarize_enabled {
+                let binarized = binarize::invert_binarize(&upscaled)?;
+                dump(&binarized, "inverted_binary");
+                binarized
+            } else {
+                upscaled
+            }
         } else {
-            bgr
+            let crop_size = bgr.size()?;
+            let short_side = crop_size.width.min(crop_size.height);
+            // Citizenship certificates are printed on watermarked security
+            // paper and are usually photographed under uneven light, not
+            // flatbed-scanned — cleaning that up before text detection runs
+            // genuinely helps a washed-out, faint-ink photo (the detector
+            // otherwise picks up the watermark's edges as noise and the
+            // recognizer loses contrast against it). But confirmed against
+            // a second real scan — a sharp, well-lit photo whose crop came
+            // out much smaller (under 650px on the short side, against
+            // 900px+ for every crop the pipeline was tuned against) — the
+            // *same* adaptive threshold instead wiped out whole strokes and
+            // made that photo read as near-total garbage where the raw
+            // crop read cleanly. The morphological close and median blur
+            // steps below use fixed pixel sizes (a 2x2 kernel, a 3px
+            // blur): sized sensibly against a 900px+ crop's stroke widths,
+            // but oversized relative to a sub-650px crop's much thinner
+            // strokes, so they erode signal instead of just noise there.
+            // Below MIN_PREPROCESS_SHORT_SIDE, skip the whole pipeline
+            // rather than run it a second, gentler way that hasn't been
+            // validated against a real scan — recognizing that a photo
+            // this small has too little margin for it. Tried instead
+            // first: running both variants and keeping whichever
+            // extraction had more populated fields — confirmed against the
+            // first real scan that this is unsound, since it once
+            // preferred a result with a swapped birth/permanent ward and a
+            // garbage `issuing_district_office` value simply because it
+            // had more non-null fields than the correct-but-sparser one.
+            if self.preprocess_enabled && short_side >= MIN_PREPROCESS_SHORT_SIDE {
+                let t_pre = std::time::Instant::now();
+                let cleaned = preprocess::denoise_for_ocr(&bgr)?;
+                if debug {
+                    eprintln!("[ocr_timing] preprocess: {:?}", t_pre.elapsed());
+                }
+                cleaned
+            } else {
+                bgr
+            }
         };
 
         // The crop/original are deleted from disk right after this request
         // (see routes::extract) — nothing about a scanned citizenship
-        // certificate needs to linger. The bbox debug image below (drawn
-        // over this same `cleaned` image) is the one thing kept, since it
-        // already shows both what the OCR models saw *and* what they found
-        // in it — a separate plain preprocessed-image dump would be
-        // redundant storage for no extra information.
+        // certificate needs to linger. The debug dumps above/below are the
+        // exception, kept at fixed filenames per side, always overwritten
+        // by the next scan of that side, never accumulating.
         let t1 = std::time::Instant::now();
         let lines = self.run_detection_pipeline(&self.det, &cleaned, debug, "primary")?;
         if debug {
@@ -231,11 +319,7 @@ impl LocalOcrEngine {
         // never found this text at all", which reading recognized strings
         // alone can't distinguish.
         if let Ok(annotated) = draw_debug_bboxes(&cleaned, &lines) {
-            let bbox_debug_path = self.output_dir.join(format!("_debug_bboxes_{side_name}.jpg"));
-            let mut bbox_bytes = Vector::<u8>::new();
-            if imgcodecs::imencode(".jpg", &annotated, &mut bbox_bytes, &params).is_ok() {
-                let _ = std::fs::write(&bbox_debug_path, bbox_bytes.as_slice());
-            }
+            dump(&annotated, "bboxed");
         }
 
         if std::env::var("OCR_DEBUG_LINES").is_ok() {
@@ -294,6 +378,7 @@ impl LocalOcrEngine {
                 polygon: quad.map(|p| [p.x.round() as i32, p.y.round() as i32]),
             });
         }
+        fields::sort_reading_order(&mut lines);
         Ok(lines)
     }
 }
