@@ -47,6 +47,15 @@ const REC_DICT: &str = include_str!("../models/devanagari_rec_dict.txt");
 const NET_INPUT_NAME: &str = "x";
 const NET_OUTPUT_NAME: &str = "fetch_name_0";
 
+/// Below this crop short-side (pixels), `preprocess::denoise_for_ocr` is
+/// skipped even when preprocessing is otherwise enabled — see the doc
+/// comment at its call site in `extract_blocking`. Picked from two real
+/// scans: every crop that needs the watermark cleanup measured 938px+ on
+/// its short side; the one real crop this destroyed measured 599-636px.
+/// Not derived analytically — if a future scan lands between the two and
+/// goes the wrong way, move this based on that scan, not by guessing.
+const MIN_PREPROCESS_SHORT_SIDE: i32 = 800;
+
 // Same PP-OCRv5_mobile_det hyperparameters the other two services use — the
 // detection model is script-agnostic.
 const DET_LIMIT_SIDE_LEN: i32 = 64;
@@ -153,12 +162,44 @@ impl LocalOcrEngine {
             return Err(AppError::EmptyImage);
         }
 
+        let side_name = match side {
+            Some("front") => "front",
+            Some("back") => "back",
+            _ => "last",
+        };
+        let mut params = Vector::<i32>::new();
+        params.push(imgcodecs::IMWRITE_JPEG_QUALITY);
+        params.push(90);
+
+        let crop_size = bgr.size()?;
+        let short_side = crop_size.width.min(crop_size.height);
+
         // Citizenship certificates are printed on watermarked security
         // paper and are usually photographed under uneven light, not
-        // flatbed-scanned — clean that up before text detection runs, since
-        // the detector otherwise picks up the watermark's edges as noise
-        // and the recognizer loses contrast against it.
-        let cleaned = if self.preprocess_enabled {
+        // flatbed-scanned — cleaning that up before text detection runs
+        // genuinely helps a washed-out, faint-ink photo (the detector
+        // otherwise picks up the watermark's edges as noise and the
+        // recognizer loses contrast against it). But confirmed against a
+        // second real scan — a sharp, well-lit photo whose crop came out
+        // much smaller (under 650px on the short side, against 900px+ for
+        // every crop the pipeline was tuned against) — the *same* adaptive
+        // threshold instead wiped out whole strokes and made that photo
+        // read as near-total garbage where the raw crop read cleanly. The
+        // morphological close and median blur steps below use fixed pixel
+        // sizes (a 2x2 kernel, a 3px blur): sized sensibly against a
+        // 900px+ crop's stroke widths, but oversized relative to a
+        // sub-650px crop's much thinner strokes, so they erode signal
+        // instead of just noise there. Below MIN_PREPROCESS_SHORT_SIDE,
+        // skip the whole pipeline rather than run it a second, gentler way
+        // that hasn't been validated against a real scan — recognizing
+        // that a photo this small has too little margin for it. Tried
+        // instead first: running both variants and keeping whichever
+        // extraction had more populated fields — confirmed against the
+        // first real scan that this is unsound, since it once preferred a
+        // result with a swapped birth/permanent ward and a garbage
+        // `issuing_district_office` value simply because it had more
+        // non-null fields than the correct-but-sparser one.
+        let cleaned = if self.preprocess_enabled && short_side >= MIN_PREPROCESS_SHORT_SIDE {
             let t_pre = std::time::Instant::now();
             let cleaned = preprocess::denoise_for_ocr(&bgr)?;
             if debug {
@@ -171,37 +212,24 @@ impl LocalOcrEngine {
 
         // The crop/original are deleted from disk right after this request
         // (see routes::extract) — nothing about a scanned citizenship
-        // certificate needs to linger. This debug image is the one
-        // exception: it's what the OCR models actually saw, which is the
-        // single most useful thing to look at when a field comes back
-        // wrong, so it's kept — but at a fixed filename per side, always
-        // overwritten by the next scan of that side, never accumulating.
-        let side_name = match side {
-            Some("front") => "front",
-            Some("back") => "back",
-            _ => "last",
-        };
-        let debug_path = self.output_dir.join(format!("_debug_preprocessed_{side_name}.jpg"));
-        let mut params = Vector::<i32>::new();
-        params.push(imgcodecs::IMWRITE_JPEG_QUALITY);
-        params.push(90);
-        let mut debug_bytes = Vector::<u8>::new();
-        if imgcodecs::imencode(".jpg", &cleaned, &mut debug_bytes, &params).is_ok() {
-            let _ = std::fs::write(&debug_path, debug_bytes.as_slice());
-        }
-
+        // certificate needs to linger. The bbox debug image below (drawn
+        // over this same `cleaned` image) is the one thing kept, since it
+        // already shows both what the OCR models saw *and* what they found
+        // in it — a separate plain preprocessed-image dump would be
+        // redundant storage for no extra information.
         let t1 = std::time::Instant::now();
         let lines = self.run_detection_pipeline(&self.det, &cleaned, debug, "primary")?;
         if debug {
             eprintln!("[ocr_timing] detection pipeline total: {:?}", t1.elapsed());
         }
 
-        // Same fixed-filename-per-side convention as the preprocessed-image
-        // dump above: draws every surviving box (green, numbered) on top of
-        // what the detector saw, plus each box's recognition confidence —
-        // the direct way to tell "detector found the right region but
-        // recognizer misread it" apart from "detector never found this text
-        // at all", which reading recognized strings alone can't distinguish.
+        // Fixed filename per side, always overwritten by the next scan of
+        // that side, never accumulating: draws every surviving box (green,
+        // numbered) on top of what the detector saw, plus each box's
+        // recognition confidence — the direct way to tell "detector found
+        // the right region but recognizer misread it" apart from "detector
+        // never found this text at all", which reading recognized strings
+        // alone can't distinguish.
         if let Ok(annotated) = draw_debug_bboxes(&cleaned, &lines) {
             let bbox_debug_path = self.output_dir.join(format!("_debug_bboxes_{side_name}.jpg"));
             let mut bbox_bytes = Vector::<u8>::new();

@@ -67,9 +67,6 @@ pub struct CitizenshipDocument {
     pub spouse_name: Option<String>,
     /// वंशज / जन्म / अंगीकृत / वैवाहिक अंगीकृत, as printed.
     pub citizenship_type: Option<String>,
-    pub issuing_district_office: Option<String>,
-    pub issuing_officer_name: Option<String>,
-    pub issuing_officer_designation: Option<String>,
     /// `YYYY-MM-DD` in Bikram Sambat, as printed.
     pub date_of_issue_bs: Option<String>,
 }
@@ -181,12 +178,17 @@ pub fn extract(lines: &[OcrLine]) -> CitizenshipDocument {
         .or_else(|| value_after_keyword(mother_block, "ना.कि", &[]));
 
     let officer_block = block_between(lines, "जारी गर्ने अधिकारी", &[]);
-    doc.issuing_officer_name = value_after_keyword(officer_block, "नाम थर", &["दर्जा"]);
-    doc.issuing_officer_designation = value_after_keyword(officer_block, "दर्जा", &["जारी मिति"]);
-    doc.date_of_issue_bs =
-        value_after_keyword(officer_block, "जारी मिति", &[]).map(|v| devanagari_digits_to_ascii(v.trim()));
-
-    doc.issuing_district_office = value_after_keyword(lines, "जिल्ला प्रशासन कार्यालय", &[]);
+    // "जारी मिति" (issue date) only ever labels this one field on the whole
+    // certificate, unlike "नाम थर"/"दर्जा" above which need the officer
+    // block's scope to avoid matching the holder's own name — so it's safe
+    // to search the full page, not just the block. That block starts at
+    // "जारी गर्ने अधिकारी", a label the recognizer frequently misreads
+    // entirely on the low-contrast bottom-left region; when it does, the
+    // block is empty and this field would otherwise go null even though the
+    // "जारी मिति : ..." line itself is read fine.
+    doc.date_of_issue_bs = value_after_keyword(officer_block, "जारी मिति", &[])
+        .or_else(|| value_after_keyword(lines, "जारी मिति", &[]))
+        .map(|v| devanagari_digits_to_ascii(v.trim()));
 
     // Never part of the response (see `Field`'s doc comment) — logged only,
     // so a scan that's coming back thinner than expected can still be
@@ -232,9 +234,6 @@ fn sanitize(mut doc: CitizenshipDocument) -> CitizenshipDocument {
     doc.mother_name = clean_text(doc.mother_name);
     doc.spouse_name = clean_text(doc.spouse_name);
     doc.citizenship_type = clean_text(doc.citizenship_type);
-    doc.issuing_district_office = clean_text(doc.issuing_district_office);
-    doc.issuing_officer_name = clean_text(doc.issuing_officer_name);
-    doc.issuing_officer_designation = clean_text(doc.issuing_officer_designation);
     doc
 }
 
@@ -264,9 +263,6 @@ pub fn combine(front: &CitizenshipDocument, back: &CitizenshipDocument) -> Citiz
         mother_name: front.mother_name.clone().or_else(|| back.mother_name.clone()),
         spouse_name: front.spouse_name.clone().or_else(|| back.spouse_name.clone()),
         citizenship_type: back.citizenship_type.clone().or_else(|| front.citizenship_type.clone()),
-        issuing_district_office: front.issuing_district_office.clone().or_else(|| back.issuing_district_office.clone()),
-        issuing_officer_name: back.issuing_officer_name.clone().or_else(|| front.issuing_officer_name.clone()),
-        issuing_officer_designation: back.issuing_officer_designation.clone().or_else(|| front.issuing_officer_designation.clone()),
         date_of_issue_bs: back.date_of_issue_bs.clone().or_else(|| front.date_of_issue_bs.clone()),
     })
 }
@@ -337,7 +333,7 @@ fn value_after_keyword(lines: &[OcrLine], keyword: &str, stop_keywords: &[&str])
             None => scope,
         };
         let value = value.trim().trim_matches(|c: char| c == '.' || c == '*' || c.is_whitespace());
-        if !value.is_empty() && !looks_like_watermark_noise(value) {
+        if !value.is_empty() && !looks_like_noise(value) {
             return Some(value.to_owned());
         }
         if let Some(value) = nearest_value_near(lines, index, stop_keywords) {
@@ -351,17 +347,34 @@ fn value_after_keyword(lines: &[OcrLine], keyword: &str, stop_keywords: &[&str])
 /// and page boilerplate — never legitimately part of a field's *value*
 /// (only its labels/headers), so a value containing one is a misread of
 /// the watermark bleeding through, not real content.
-const WATERMARK_PHRASES: &[&str] = &[
+// Boilerplate/watermark substrings that are never legitimately part of a
+// field's *value* — only its labels, headers, or standard printed notices.
+// A value containing one is a misread bleeding in from elsewhere on the
+// page, not real content. Note these are checked against the *extracted
+// value*, i.e. whatever's left after the matched keyword itself is
+// stripped off — so a phrase here needs to survive that stripping no
+// matter which keyword-length prefix of it a search happened to consume.
+// The submission-notice entries below are a real example: a keyword search
+// for "जिल्ला प्रशासन कार्यालय" (issuing office) or even just "जिल्ला"
+// (birth/permanent district) can both land on the standard "submit to the
+// district administration or police office" footer instead of a real
+// office/district — the "जिल्ला प्रशासन" phrase in the *source line*
+// doesn't survive being the matched keyword, so only the boilerplate's
+// unconsumed remainder ("...office or police office, kindly submit") is
+// listed here.
+const NOISE_PHRASES: &[&str] = &[
     "नागरिकताको प्रमाण",
     "नागरिकता ऐन",
     "नेपाली नागरिकता",
     "नेपाल सरकार",
     "गृह मन्त्रालय",
     "जिल्ला प्रशासन",
+    "कार्यालयमा वा प्रहरी कार्यालयमा",
+    "बुझाईदिनुहोला",
 ];
 
-fn looks_like_watermark_noise(text: &str) -> bool {
-    WATERMARK_PHRASES.iter().any(|phrase| text.contains(phrase))
+fn looks_like_noise(text: &str) -> bool {
+    NOISE_PHRASES.iter().any(|phrase| text.contains(phrase))
 }
 
 /// A ward number is 1-2 plain digits — nothing else a real value could be.
@@ -648,7 +661,7 @@ fn nearest_value_near(lines: &[OcrLine], label_index: usize, stop_keywords: &[&s
 
     let chosen = best_right.or(best_below)?.1;
     let value = lines[chosen].text.trim().trim_matches(|c: char| c == '.' || c == '*' || c.is_whitespace());
-    (!value.is_empty() && !looks_like_watermark_noise(value)).then(|| value.to_owned())
+    (!value.is_empty() && !looks_like_noise(value)).then(|| value.to_owned())
 }
 
 #[derive(Clone, Copy)]
@@ -849,8 +862,6 @@ mod tests {
         assert_eq!(doc.permanent_municipality.as_deref(), Some("badhaiyatal"));
         assert_eq!(doc.permanent_ward.as_deref(), Some("2"));
         assert_eq!(doc.citizenship_type.as_deref(), Some("वंशज"));
-        assert_eq!(doc.issuing_officer_name.as_deref(), Some("गणेश विक्रम शाह"));
-        assert_eq!(doc.issuing_officer_designation.as_deref(), Some("प्रशासकीय अधिकृत"));
         assert_eq!(doc.date_of_issue_bs.as_deref(), Some("2077-08-07"));
     }
 
@@ -867,7 +878,6 @@ mod tests {
         assert_eq!(combined.date_of_birth_bs.as_deref(), Some("2060-10-26"));
         assert_eq!(combined.father_name.as_deref(), Some("रामजी प्रसाद अधिकारी"));
         assert_eq!(combined.mother_name.as_deref(), Some("फुलमाया अधिकारी"));
-        assert_eq!(combined.issuing_officer_name.as_deref(), Some("गणेश विक्रम शाह"));
     }
 
     #[test]

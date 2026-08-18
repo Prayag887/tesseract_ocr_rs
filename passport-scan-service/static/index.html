@@ -338,6 +338,7 @@
     max-width: 100%;
     max-height: 240px;
     object-fit: contain;
+    cursor: pointer;
   }
 
   .cz-stage svg { position: absolute; inset: 0; width: 100%; height: 100%; }
@@ -444,6 +445,9 @@
             <button data-role="applyCrop" type="button" class="secondary">Apply crop</button>
             <button data-role="resetCrop" type="button" class="secondary">Reset corners</button>
           </div>
+          <div class="crop-actions" data-role="replaceRow" hidden>
+            <button data-role="replaceImage" type="button" class="secondary">Replace image</button>
+          </div>
           <input data-role="file" type="file" accept="image/*" hidden>
         </div>
       </article>
@@ -469,6 +473,9 @@
           <div class="crop-actions" data-role="cropActions" hidden>
             <button data-role="applyCrop" type="button" class="secondary">Apply crop</button>
             <button data-role="resetCrop" type="button" class="secondary">Reset corners</button>
+          </div>
+          <div class="crop-actions" data-role="replaceRow" hidden>
+            <button data-role="replaceImage" type="button" class="secondary">Replace image</button>
           </div>
           <input data-role="file" type="file" accept="image/*" hidden>
         </div>
@@ -664,7 +671,11 @@ function handlePaste(event) {
     if (!item.type.startsWith('image/')) continue;
     const image = item.getAsFile();
     if (image) {
-      setFile(image);
+      if (activeKey === 'citizenship') {
+        pasteCzImage(image);
+      } else {
+        setFile(image);
+      }
       event.preventDefault();
     }
     break;
@@ -979,6 +990,8 @@ function createCzSide(container) {
   const cropActionsEl = container.querySelector('[data-role="cropActions"]');
   const applyCropBtnEl = container.querySelector('[data-role="applyCrop"]');
   const resetCropBtnEl = container.querySelector('[data-role="resetCrop"]');
+  const replaceRowEl = container.querySelector('[data-role="replaceRow"]');
+  const replaceImageBtnEl = container.querySelector('[data-role="replaceImage"]');
 
   const state = {
     scanId: null,
@@ -1080,6 +1093,7 @@ function createCzSide(container) {
     stageEl.hidden = false;
     overlayEl.replaceChildren();
     cropActionsEl.hidden = true;
+    replaceRowEl.hidden = false;
     state.pendingFile = prepared;
     state.scanId = null;
     state.extracted = null;
@@ -1138,6 +1152,20 @@ function createCzSide(container) {
     if (fileInputEl.files.length) stageFile(fileInputEl.files[0]);
   });
 
+  // Once a side is staged, the mini-drop is hidden and the preview image
+  // takes its place — without this, there'd be no way to swap in a
+  // different image or rescan the same side short of reloading the page.
+  // Clicking or dropping onto the preview image re-opens the file picker /
+  // re-stages, same as the initial mini-drop did. Bound to the <img> itself,
+  // not the whole stage — the stage also contains the crop-corner overlay,
+  // and this must not intercept clicks/drags on those handles.
+  imgEl.addEventListener('click', () => fileInputEl.click());
+  imgEl.addEventListener('dragover', (event) => event.preventDefault());
+  imgEl.addEventListener('drop', (event) => {
+    event.preventDefault();
+    if (event.dataTransfer.files.length) stageFile(event.dataTransfer.files[0]);
+  });
+
   applyCropBtnEl.addEventListener('click', async () => {
     if (!state.scanId || !state.corners) return;
     applyCropBtnEl.disabled = true;
@@ -1164,11 +1192,17 @@ function createCzSide(container) {
     drawOverlay();
   });
 
+  replaceImageBtnEl.addEventListener('click', () => fileInputEl.click());
+
   return {
     sideKey,
     scan: scanAndExtract,
+    stage: stageFile,
     get extracted() { return state.extracted; },
     get hasPending() { return state.pendingFile !== null; },
+    // True once this side has any image at all (staged or already scanned)
+    // — used to decide where a pasted image should land.
+    get hasImage() { return state.objectUrl !== null; },
   };
 }
 
@@ -1176,6 +1210,19 @@ const czFront = createCzSide(document.querySelector('.cz-side[data-side="front"]
 const czBack = createCzSide(document.querySelector('.cz-side[data-side="back"]'));
 const czScanBtn = document.getElementById('czScanBtn');
 const czScanHint = document.getElementById('czScanHint');
+
+// Ctrl/Cmd+V while on the citizenship tab: first paste fills the front,
+// second paste fills the back — same "first page front, second page back"
+// order as dropping/browsing each side manually. Once both sides already
+// have an image, further pastes replace the back (the side you're more
+// likely to be redoing).
+function pasteCzImage(file) {
+  if (!czFront.hasImage) {
+    czFront.stage(file);
+  } else {
+    czBack.stage(file);
+  }
+}
 
 function updateScanButton() {
   const ready = czFront.hasPending || czBack.hasPending;
@@ -1205,11 +1252,17 @@ czScanBtn.addEventListener('click', async () => {
 let czCombineController = null;
 
 async function renderCombined() {
-  if (!czFront.extracted && !czBack.extracted) {
+  // JSON is only produced once BOTH sides have been scanned — a single side
+  // can be misread in ways the other side's data would otherwise silently
+  // paper over (see combine()'s cross-side preference logic), so a
+  // one-sided result isn't shown as if it were final.
+  if (!czFront.extracted || !czBack.extracted) {
     czFieldsEl.hidden = true;
     czFieldsStatusEl.hidden = false;
-    czFieldsStatusEl.textContent = 'Scan the front and/or back above — the combined JSON updates automatically as each side finishes.';
-    czFieldCountEl.textContent = 'Waiting for extraction';
+    czFieldsStatusEl.textContent = czFront.extracted || czBack.extracted
+      ? 'One side is done — scan the other side to get the combined JSON.'
+      : 'Scan both the front and back above to get the combined JSON.';
+    czFieldCountEl.textContent = 'Waiting for both sides';
     czCopyBtn.disabled = true;
     return;
   }
