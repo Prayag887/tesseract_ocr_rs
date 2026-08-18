@@ -2,7 +2,7 @@ name: Build & Test
 
 on:
   push:
-    branches: [prod, main]
+    branches: [rhel_prod, prod, main]
   pull_request:
   workflow_dispatch:
 
