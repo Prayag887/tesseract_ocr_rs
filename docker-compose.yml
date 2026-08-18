@@ -1,22 +1,24 @@
-# Two independent services, one container each — no shared runtime between
-# them (see static/index.html: only the frontend is shared). Each builds from
-# its own Dockerfile and its own build context, so neither can see the other's
-# sources.
+# Three independent services, one container each — no shared runtime between
+# them (see nid-scan-service/static/index.html: only the frontend is
+# shared, byte-identical across all three services' static/ directories).
+# Each builds from its own Dockerfile and its own build context, so none can
+# see another's sources.
 #
-# An nginx `gateway` fronts both so the UI lives on ONE host port while the two
-# APIs stay separate, path-routed exactly as in production:
+# An nginx `gateway` fronts all three so the UI lives on ONE host port while
+# the APIs stay separate, path-routed exactly as in production:
 #
-#   http://localhost:3002/           -> the UI
-#   http://localhost:3002/nid/       -> nid-scan-service      (prefix stripped)
-#   http://localhost:3002/passport/  -> passport-scan-service (prefix stripped)
+#   http://localhost:3002/              -> the UI
+#   http://localhost:3002/nid/          -> nid-scan-service          (prefix stripped)
+#   http://localhost:3002/passport/     -> passport-scan-service     (prefix stripped)
+#   http://localhost:3002/citizenship/  -> citizenship-scan-service  (prefix stripped)
 #
 # The backends are deliberately NOT published to the host: one forwarded port
 # reaches everything, which is the whole point. To hit a backend directly for
 # debugging, add a `ports:` entry back, or go through the gateway prefix.
 #
-# NOTE: both Dockerfiles build OpenCV 5.0.0 from source, so the first
+# NOTE: all three Dockerfiles build OpenCV 5.0.0 from source, so the first
 # `docker compose build` takes a long time (tens of minutes each, and they are
-# built independently — no layer sharing between the two contexts).
+# built independently — no layer sharing between the contexts).
 
 services:
   gateway:
@@ -40,10 +42,12 @@ services:
         condition: service_healthy
       passport-scan-service:
         condition: service_healthy
+      citizenship-scan-service:
+        condition: service_healthy
 
   nid-scan-service:
     build:
-      context: .
+      context: ./nid-scan-service
       dockerfile: Dockerfile
     image: ocr-nid-scan-service:latest
     container_name: nid-scan-service
@@ -97,6 +101,31 @@ services:
     volumes:
       - passport-scanned-documents:/app/scanned_document
 
+  citizenship-scan-service:
+    build:
+      context: ./citizenship_scanner
+      dockerfile: Dockerfile
+    image: ocr-citizenship-scan-service:latest
+    container_name: citizenship-scan-service
+    restart: unless-stopped
+    # Reached only via the gateway, at /citizenship/.
+    expose:
+      - "3004"
+    environment:
+      CITIZENSHIP_OCR_MIN_CONFIDENCE: "${CITIZENSHIP_OCR_MIN_CONFIDENCE:-0.45}"
+      # Watermark/lighting cleanup (preprocess.rs) runs before OCR by
+      # default — set to "false" to compare against the raw crop.
+      CITIZENSHIP_OCR_PREPROCESS: "${CITIZENSHIP_OCR_PREPROCESS:-true}"
+      # See the nid service above.
+      MALLOC_ARENA_MAX: "2"
+      # OCR_DEBUG_LINES: "1"
+      # OCR_DEBUG_TIMING: "1"
+      # SCAN_DEBUG_TIMING: "1"
+      RUST_LOG: "${RUST_LOG:-info,tower_http=debug}"
+    volumes:
+      - citizenship-scanned-documents:/app/scanned_document
+
 volumes:
   nid-scanned-documents:
   passport-scanned-documents:
+  citizenship-scanned-documents:

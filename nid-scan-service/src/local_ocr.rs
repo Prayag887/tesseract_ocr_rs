@@ -1,0 +1,665 @@
+use std::sync::Mutex;
+
+use opencv::core::{
+    CV_8U, Mat, MatTraitConst, Point, Point2f, Rect, RotatedRect, Scalar, Size, Vec3b, Vector,
+};
+use opencv::prelude::*;
+use opencv::{geometry, imgcodecs, imgproc};
+use ort::session::Session;
+use ort::value::Tensor;
+
+use crate::error::AppError;
+use crate::ocr::{Field, OcrDocument, OcrLine, parse_fields, reading_order};
+
+const DET_MODEL_PATH: &str = "models/ppocrv5_det.onnx";
+const TEXTLINE_ORI_MODEL_PATH: &str = "models/textline_ori.onnx";
+const REC_MODEL_PATH: &str = "models/devanagari_rec.onnx";
+const REC_DICT: &str = include_str!("../models/devanagari_rec_dict.txt");
+
+const NET_INPUT_NAME: &str = "x";
+const NET_OUTPUT_NAME: &str = "fetch_name_0";
+
+// Mirrors OCR.yaml's active hyperparameters for PP-OCRv5_mobile_det, so the
+// native path produces the same boxes the Python PaddleX sidecar did.
+const DET_LIMIT_SIDE_LEN: i32 = 64;
+const DET_MAX_SIDE_LIMIT: i32 = 4000;
+const DET_THRESH: f64 = 0.3;
+const DET_BOX_THRESH: f32 = 0.6;
+const DET_UNCLIP_RATIO: f32 = 1.5;
+const DET_MIN_BOX_SIDE: f32 = 3.0;
+
+// Standard ImageNet normalization, shared by the PP-LCNet-backboned det and
+// textline-orientation models: (pixel/255 - mean) / std, per channel.
+const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
+
+const TEXTLINE_ORI_WIDTH: i32 = 160;
+const TEXTLINE_ORI_HEIGHT: i32 = 80;
+
+// devanagari_PP-OCRv5_mobile_rec's fixed input height; width is derived per
+// crop to preserve aspect ratio. (crop-width/crop-height)*48, resized to
+// height 48 — verified against real recognized text ("ROSHAN JOSHI",
+// "2003-01-24", etc.) before being wired in here.
+const REC_HEIGHT: i32 = 48;
+const REC_MAX_WIDTH: i32 = 2000;
+const DEFAULT_ORIENTATION_BATCH_SIZE: usize = 8;
+const DEFAULT_RECOGNITION_BATCH_SIZE: usize = 1;
+const MAX_BATCH_SIZE: usize = 64;
+const MAX_RECOGNITION_WORKERS: usize = 8;
+
+/// Native ONNX inference for PP-OCRv5, replacing the Python PaddleX sidecar
+/// (`PaddleOcrClient`) for latency: no HTTP round-trip, no Python process.
+/// Same three models the sidecar ran (`OCR.yaml`), same math, run in-process
+/// via OpenCV's `dnn` module — the same pattern already used in
+/// `scanner.rs` for the document-corner model.
+pub struct LocalOcrEngine {
+    det: Mutex<Session>,
+    textline_ori: Mutex<Session>,
+    rec: Vec<Mutex<Session>>,
+    /// index 0 = CTC blank, 1..=568 = `devanagari_rec_dict.txt`, 569 = space
+    /// — the exact convention `inference.yml`'s `character_dict` encodes.
+    rec_vocab: Vec<&'static str>,
+    min_confidence: f32,
+    orientation_batch_size: usize,
+    recognition_batch_size: usize,
+}
+
+impl LocalOcrEngine {
+    pub fn load() -> Result<Self, AppError> {
+        let det = Session::builder()?.commit_from_file(DET_MODEL_PATH)?;
+        let textline_ori = Session::builder()?.commit_from_file(TEXTLINE_ORI_MODEL_PATH)?;
+        let mut rec_vocab = Vec::with_capacity(570);
+        rec_vocab.push(""); // CTC blank
+        rec_vocab.extend(REC_DICT.lines());
+        rec_vocab.push(" ");
+
+        let min_confidence = std::env::var("PADDLE_OCR_MIN_CONFIDENCE")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(0.45);
+        let orientation_batch_size =
+            env_usize("OCR_ORIENTATION_BATCH_SIZE", DEFAULT_ORIENTATION_BATCH_SIZE)
+                .clamp(1, MAX_BATCH_SIZE);
+        let recognition_batch_size =
+            env_usize("OCR_RECOGNITION_BATCH_SIZE", DEFAULT_RECOGNITION_BATCH_SIZE)
+                .clamp(1, MAX_BATCH_SIZE);
+        let recognition_workers =
+            env_usize("OCR_RECOGNITION_WORKERS", default_recognition_workers())
+                .clamp(1, MAX_RECOGNITION_WORKERS);
+        let mut rec = Vec::with_capacity(recognition_workers);
+        for _ in 0..recognition_workers {
+            rec.push(Mutex::new(
+                Session::builder()?.commit_from_file(REC_MODEL_PATH)?,
+            ));
+        }
+        tracing::info!(recognition_workers, "OCR recognition workers configured");
+
+        Ok(Self {
+            det: Mutex::new(det),
+            textline_ori: Mutex::new(textline_ori),
+            rec,
+            rec_vocab,
+            min_confidence,
+            orientation_batch_size,
+            recognition_batch_size,
+        })
+    }
+
+    /// Dispatches the actually-synchronous, CPU-bound work in
+    /// `extract_blocking` onto the blocking pool so it can't stall the
+    /// async reactor — same reasoning as `scanner::scan_document`, which
+    /// this function previously lacked despite doing the same kind of
+    /// OpenCV/dnn work: an unrelated request sharing this worker thread
+    /// would queue up behind however long OCR inference takes.
+    pub async fn extract(&self, image: &[u8]) -> Result<OcrDocument, AppError> {
+        tokio::task::block_in_place(|| self.extract_blocking(image))
+    }
+
+    fn extract_blocking(&self, image: &[u8]) -> Result<OcrDocument, AppError> {
+        let debug = std::env::var("OCR_DEBUG_TIMING").is_ok();
+        let t0 = std::time::Instant::now();
+        let buf = Vector::<u8>::from_slice(image);
+        let bgr = imgcodecs::imdecode(&buf, imgcodecs::IMREAD_COLOR).map_err(AppError::Decode)?;
+        if bgr.empty() {
+            return Err(AppError::EmptyImage);
+        }
+
+        let t1 = std::time::Instant::now();
+        let quads = detect_text_boxes(&self.det, &bgr)?;
+        if debug {
+            eprintln!(
+                "[ocr_timing] detect_text_boxes: {:?} ({} boxes)",
+                t1.elapsed(),
+                quads.len()
+            );
+        }
+
+        let t2 = std::time::Instant::now();
+        let mut crops = Vec::with_capacity(quads.len());
+        for quad in &quads {
+            crops.push(crop_quad(&bgr, quad)?);
+        }
+        let crops = classify_and_fix_rotation_batch(
+            &self.textline_ori,
+            crops,
+            self.orientation_batch_size,
+        )?;
+        if debug {
+            eprintln!(
+                "[ocr_timing] crop + batched orientation: {:?}",
+                t2.elapsed()
+            );
+        }
+
+        let t3 = std::time::Instant::now();
+        let recognized = recognize_lines_parallel(
+            &self.rec,
+            &self.rec_vocab,
+            &crops,
+            self.recognition_batch_size,
+        )?;
+        if debug {
+            eprintln!("[ocr_timing] batched recognition: {:?}", t3.elapsed());
+        }
+
+        let mut lines = Vec::with_capacity(quads.len());
+        for (quad, (text, confidence)) in quads.into_iter().zip(recognized) {
+            let text = text.trim();
+            if text.is_empty() || confidence < self.min_confidence {
+                continue;
+            }
+            lines.push(OcrLine {
+                text: text.to_owned(),
+                confidence,
+                polygon: quad.map(|p| [p.x.round() as i32, p.y.round() as i32]),
+            });
+        }
+
+        lines.sort_by(reading_order);
+        if std::env::var("OCR_DEBUG_LINES").is_ok() {
+            for (i, line) in lines.iter().enumerate() {
+                tracing::info!("line {i}: {:?} conf={:.3}", line.text, line.confidence);
+            }
+        }
+        let fields: Vec<Field> = parse_fields(&lines);
+        if debug {
+            eprintln!("[ocr_timing] total: {:?}", t0.elapsed());
+        }
+        Ok(OcrDocument { fields })
+    }
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn default_recognition_workers() -> usize {
+    let logical_cpus = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    let request_concurrency = env_usize("OCR_MAX_CONCURRENCY", 2).clamp(1, 64);
+    logical_cpus
+        .div_ceil(request_concurrency)
+        .clamp(1, MAX_RECOGNITION_WORKERS)
+}
+
+fn forward(
+    net: &Mutex<Session>,
+    shape: [usize; 4],
+    data: Vec<f32>,
+) -> Result<(Vec<i64>, Vec<f32>), AppError> {
+    let input = Tensor::from_array((shape, data))?;
+    let mut net = net.lock().expect("ort Session mutex poisoned");
+    let outputs = net.run(ort::inputs![NET_INPUT_NAME => input])?;
+    let (out_shape, out_data) = outputs[NET_OUTPUT_NAME].try_extract_tensor::<f32>()?;
+    Ok((out_shape.to_vec(), out_data.to_vec()))
+}
+
+/// Packs an already-resized RGB `u8` `Mat` into an NCHW `f32` tensor,
+/// applying `(pixel/255 - mean) / std` per channel. Built by hand rather
+/// than through `dnn::blob_from_image` because that helper only supports a
+/// single `scalefactor` shared across channels, and ImageNet's per-channel
+/// std values differ slightly — close enough that the difference wouldn't
+/// be visually obvious, but exact math was verified against real recognized
+/// text before trusting it, and there's no reason to settle for approximate
+/// when exact costs the same amount of code.
+fn imagenet_nchw(rgb: &Mat) -> Result<Vec<f32>, AppError> {
+    let rows = rgb.rows();
+    let cols = rgb.cols();
+    let pixels = rgb.data_typed::<Vec3b>()?;
+    let plane = (rows * cols) as usize;
+    let mut out = vec![0f32; 3 * plane];
+    for (index, pixel) in pixels.iter().enumerate() {
+        for channel in 0..3 {
+            let value = f32::from(pixel[channel]) / 255.0;
+            out[channel * plane + index] = (value - IMAGENET_MEAN[channel]) / IMAGENET_STD[channel];
+        }
+    }
+    Ok(out)
+}
+
+/// DB's side-limit resize rule (`limit_type: min`) plus PaddleX's
+/// `max_side_limit` cap, rounded to a multiple of 32 as the detection
+/// backbone requires. Matches `OCR.yaml` exactly.
+fn det_resize_dims(height: i32, width: i32) -> (i32, i32) {
+    let mut ratio = 1.0_f64;
+    if f64::from(height.min(width)) < f64::from(DET_LIMIT_SIDE_LEN) {
+        ratio = f64::from(DET_LIMIT_SIDE_LEN) / f64::from(height.min(width));
+    }
+    let mut resize_h = (f64::from(height) * ratio) as i32;
+    let mut resize_w = (f64::from(width) * ratio) as i32;
+    if f64::from(resize_h.max(resize_w)) > f64::from(DET_MAX_SIDE_LIMIT) {
+        let cap = f64::from(DET_MAX_SIDE_LIMIT) / f64::from(resize_h.max(resize_w));
+        resize_h = (f64::from(resize_h) * cap) as i32;
+        resize_w = (f64::from(resize_w) * cap) as i32;
+    }
+    let round32 = |value: i32| ((f64::from(value) / 32.0).round() as i32 * 32).max(32);
+    (round32(resize_h), round32(resize_w))
+}
+
+/// Detects text line boxes and returns their quads in the *original*
+/// image's pixel space, ordered [top-left, top-right, bottom-right,
+/// bottom-left] — DB thresholding + contour extraction + unclip, the same
+/// postprocessing PaddleX's server-side pipeline does for
+/// `PP-OCRv5_mobile_det`.
+fn detect_text_boxes(det: &Mutex<Session>, image: &Mat) -> Result<Vec<[Point2f; 4]>, AppError> {
+    let size = image.size()?;
+    let (orig_w, orig_h) = (size.width, size.height);
+    let (resize_h, resize_w) = det_resize_dims(orig_h, orig_w);
+
+    let mut resized_bgr = Mat::default();
+    imgproc::resize(
+        image,
+        &mut resized_bgr,
+        Size::new(resize_w, resize_h),
+        0.0,
+        0.0,
+        imgproc::INTER_LINEAR,
+    )?;
+    let mut resized_rgb = Mat::default();
+    imgproc::cvt_color_def(&resized_bgr, &mut resized_rgb, imgproc::COLOR_BGR2RGB)?;
+
+    let data = imagenet_nchw(&resized_rgb)?;
+    let (_shape, prob_data) = forward(det, [1, 3, resize_h as usize, resize_w as usize], data)?;
+    let prob_2d: Mat = Mat::new_rows_cols_with_data(resize_h, resize_w, &prob_data)?.try_clone()?;
+
+    let mut binary = Mat::default();
+    imgproc::threshold(
+        &prob_2d,
+        &mut binary,
+        DET_THRESH,
+        255.0,
+        imgproc::THRESH_BINARY,
+    )?;
+    let mut binary_u8 = Mat::default();
+    binary.convert_to(&mut binary_u8, CV_8U, 1.0, 0.0)?;
+
+    let mut contours = Vector::<Vector<Point>>::new();
+    imgproc::find_contours_def(
+        &binary_u8,
+        &mut contours,
+        imgproc::RETR_LIST,
+        imgproc::CHAIN_APPROX_SIMPLE,
+    )?;
+
+    let ratio_w = resize_w as f32 / orig_w as f32;
+    let ratio_h = resize_h as f32 / orig_h as f32;
+
+    let mut boxes = Vec::new();
+    for contour in &contours {
+        if contour.len() < 3 {
+            continue;
+        }
+        let rect = geometry::min_area_rect(&contour)?;
+        if rect.size.width.min(rect.size.height) < DET_MIN_BOX_SIDE {
+            continue;
+        }
+
+        let score = box_score(&prob_2d, rect, resize_w, resize_h)?;
+        if score < DET_BOX_THRESH {
+            continue;
+        }
+
+        let expanded = unclip(rect, DET_UNCLIP_RATIO);
+        if expanded.size.width.min(expanded.size.height) < DET_MIN_BOX_SIDE {
+            continue;
+        }
+
+        let mut points = [Point2f::default(); 4];
+        expanded.points(&mut points)?;
+        // RotatedRect::points' bottomLeft/topLeft/topRight/bottomRight
+        // labels are relative to OpenCV's internal (width, height, angle)
+        // assignment, which can swap width/height for a near-axis-aligned
+        // box — i.e. those labels do NOT reliably mean actual screen
+        // top-left/top-right. Order geometrically instead (same sum/diff
+        // trick as scanner.rs's order_corners), or crop_quad ends up
+        // treating the short edge as "width", producing tall narrow crops
+        // that recognize as empty garbage — caught via a real scan where
+        // every crop came back portrait-shaped and blank.
+        let quad = order_corners(points).map(|p| {
+            Point2f::new(
+                (p.x / ratio_w).clamp(0.0, orig_w as f32 - 1.0),
+                (p.y / ratio_h).clamp(0.0, orig_h as f32 - 1.0),
+            )
+        });
+        boxes.push(quad);
+    }
+
+    boxes.sort_unstable_by(|a, b| {
+        let a_top = a.iter().map(|p| p.y).fold(f32::MAX, f32::min);
+        let b_top = b.iter().map(|p| p.y).fold(f32::MAX, f32::min);
+        let a_left = a.iter().map(|p| p.x).fold(f32::MAX, f32::min);
+        let b_left = b.iter().map(|p| p.x).fold(f32::MAX, f32::min);
+        a_top
+            .total_cmp(&b_top)
+            .then_with(|| a_left.total_cmp(&b_left))
+    });
+
+    Ok(boxes)
+}
+
+/// Mean detection-probability inside the box's own quad, masked — not its
+/// axis-aligned bounding rectangle. PaddleOCR's own `box_score_fast` does
+/// the same thing for exactly this reason: a wide, sparsely-spaced line
+/// ("FULL NAME", "ROSHAN JOSHI") has a bounding box mostly made of
+/// background between words/letters, so averaging over the whole bbox
+/// dilutes the score below `box_thresh` and silently drops real text lines
+/// — while short dense words ("SEX", "M") survive since their bbox is
+/// mostly ink. Confirmed by a real scan where exactly the wide/sparse lines
+/// went missing under the bbox-mean approximation.
+fn box_score(prob_2d: &Mat, rect: RotatedRect, map_w: i32, map_h: i32) -> Result<f32, AppError> {
+    let bounding = rect.bounding_rect()?;
+    let x0 = bounding.x.max(0);
+    let y0 = bounding.y.max(0);
+    let x1 = (bounding.x + bounding.width).min(map_w);
+    let y1 = (bounding.y + bounding.height).min(map_h);
+    if x1 <= x0 || y1 <= y0 {
+        return Ok(0.0);
+    }
+    let roi = prob_2d.roi(Rect::new(x0, y0, x1 - x0, y1 - y0))?;
+
+    let mut quad_points = [Point2f::default(); 4];
+    rect.points(&mut quad_points)?;
+    let local_points: Vector<Point> = quad_points
+        .iter()
+        .map(|p| {
+            Point::new(
+                (p.x - x0 as f32).round() as i32,
+                (p.y - y0 as f32).round() as i32,
+            )
+        })
+        .collect();
+    let mut contour_group = Vector::<Vector<Point>>::new();
+    contour_group.push(local_points);
+
+    let mut mask = Mat::new_rows_cols_with_default(y1 - y0, x1 - x0, CV_8U, Scalar::all(0.0))?;
+    imgproc::fill_poly_def(&mut mask, &contour_group, Scalar::all(1.0))?;
+
+    let mean = opencv::core::mean(&roi, &mask)?;
+    Ok(mean[0] as f32)
+}
+
+/// Offsets a (near-)rectangular box outward by DB's standard unclip
+/// distance (`area * ratio / perimeter`). For a rectangle, offsetting every
+/// edge outward by that distance is exactly growing width and height by
+/// `2 * distance` around the same center — the same result PaddleOCR's own
+/// polygon-offset (pyclipper) produces for a box this close to a rectangle.
+fn unclip(rect: RotatedRect, ratio: f32) -> RotatedRect {
+    let (w, h) = (rect.size.width, rect.size.height);
+    let perimeter = 2.0 * (w + h);
+    let distance = if perimeter > 0.0 {
+        w * h * ratio / perimeter
+    } else {
+        0.0
+    };
+    RotatedRect {
+        center: rect.center,
+        size: opencv::core::Size2f::new(w + 2.0 * distance, h + 2.0 * distance),
+        angle: rect.angle,
+    }
+}
+
+/// Orders 4 arbitrary points as [top-left, top-right, bottom-right,
+/// bottom-left] using the sum/difference trick: top-left has the smallest
+/// x+y, bottom-right the largest; top-right has the smallest x-y,
+/// bottom-left the largest. Same approach as `scanner.rs`'s
+/// `order_corners` — geometric, so it doesn't depend on any particular
+/// source's notion of which corner is which.
+fn order_corners(points: [Point2f; 4]) -> [Point2f; 4] {
+    let top_left = *points
+        .iter()
+        .min_by(|a, b| (a.x + a.y).total_cmp(&(b.x + b.y)))
+        .expect("exactly 4 points");
+    let bottom_right = *points
+        .iter()
+        .max_by(|a, b| (a.x + a.y).total_cmp(&(b.x + b.y)))
+        .expect("exactly 4 points");
+    let top_right = *points
+        .iter()
+        .max_by(|a, b| (a.x - a.y).total_cmp(&(b.x - b.y)))
+        .expect("exactly 4 points");
+    let bottom_left = *points
+        .iter()
+        .min_by(|a, b| (a.x - a.y).total_cmp(&(b.x - b.y)))
+        .expect("exactly 4 points");
+    [top_left, top_right, bottom_right, bottom_left]
+}
+
+fn dist(a: Point2f, b: Point2f) -> f64 {
+    (f64::from(a.x - b.x).powi(2) + f64::from(a.y - b.y).powi(2)).sqrt()
+}
+
+/// Perspective-crops `image` to the quad `[tl, tr, br, bl]`, matching
+/// `scanner.rs`'s `warp_document` convention.
+fn crop_quad(image: &Mat, corners: &[Point2f; 4]) -> Result<Mat, AppError> {
+    let [tl, tr, br, bl] = *corners;
+    let width = (dist(tl, tr).max(dist(bl, br)).round() as i32).max(1);
+    let height = (dist(tl, bl).max(dist(tr, br)).round() as i32).max(1);
+
+    let dst = [
+        Point2f::new(0.0, 0.0),
+        Point2f::new((width - 1) as f32, 0.0),
+        Point2f::new((width - 1) as f32, (height - 1) as f32),
+        Point2f::new(0.0, (height - 1) as f32),
+    ];
+    let transform = geometry::get_perspective_transform_slice_def([tl, tr, br, bl], dst)?;
+
+    let mut warped = Mat::default();
+    imgproc::warp_perspective_def(image, &mut warped, &transform, Size::new(width, height))?;
+    Ok(warped)
+}
+
+/// Classifies the crop's text orientation (0°/180°) and flips it if the
+/// model says it's upside down. Uses the same ImageNet normalization as
+/// detection (both are PP-LCNet backbones) — structurally verified (model
+/// output is a proper softmax distribution) but not verified against a
+/// known-rotated ground-truth line, since every line on the real test scan
+/// was already upright. Low risk: on a misclassification the crop is used
+/// as-is, same as if this step didn't run at all.
+fn classify_and_fix_rotation_batch(
+    textline_ori: &Mutex<Session>,
+    mut crops: Vec<Mat>,
+    batch_size: usize,
+) -> Result<Vec<Mat>, AppError> {
+    for chunk in crops.chunks_mut(batch_size) {
+        let sample_len = (3 * TEXTLINE_ORI_HEIGHT * TEXTLINE_ORI_WIDTH) as usize;
+        let mut data = Vec::with_capacity(chunk.len() * sample_len);
+        for crop in chunk.iter() {
+            let mut resized = Mat::default();
+            imgproc::resize(
+                crop,
+                &mut resized,
+                Size::new(TEXTLINE_ORI_WIDTH, TEXTLINE_ORI_HEIGHT),
+                0.0,
+                0.0,
+                imgproc::INTER_LINEAR,
+            )?;
+            let mut rgb = Mat::default();
+            imgproc::cvt_color_def(&resized, &mut rgb, imgproc::COLOR_BGR2RGB)?;
+            data.extend(imagenet_nchw(&rgb)?);
+        }
+        let (_shape, out) = forward(
+            textline_ori,
+            [
+                chunk.len(),
+                3,
+                TEXTLINE_ORI_HEIGHT as usize,
+                TEXTLINE_ORI_WIDTH as usize,
+            ],
+            data,
+        )?;
+
+        for (index, crop) in chunk.iter_mut().enumerate() {
+            let upright = out[index * 2];
+            let flipped = out[index * 2 + 1];
+            if flipped > upright {
+                let mut rotated = Mat::default();
+                opencv::core::flip(crop, &mut rotated, -1)?;
+                *crop = rotated;
+            }
+        }
+    }
+    Ok(crops)
+}
+
+fn recognize_lines_parallel(
+    recognizers: &[Mutex<Session>],
+    vocab: &[&str],
+    crops: &[Mat],
+    batch_size: usize,
+) -> Result<Vec<(String, f32)>, AppError> {
+    if recognizers.len() == 1 || crops.len() <= 1 {
+        return recognize_lines_batch(&recognizers[0], vocab, crops, batch_size);
+    }
+
+    let worker_count = recognizers.len().min(crops.len());
+    let chunk_size = crops.len().div_ceil(worker_count);
+    let mut recognized = Vec::with_capacity(crops.len());
+    std::thread::scope(|scope| -> Result<(), AppError> {
+        let mut handles = Vec::with_capacity(worker_count);
+        for (recognizer, chunk) in recognizers.iter().zip(crops.chunks(chunk_size)) {
+            handles.push(
+                scope.spawn(move || recognize_lines_batch(recognizer, vocab, chunk, batch_size)),
+            );
+        }
+        for handle in handles {
+            recognized.extend(handle.join().map_err(|_| AppError::OcrWorkerPanicked)??);
+        }
+        Ok(())
+    })?;
+    Ok(recognized)
+}
+
+fn recognize_lines_batch(
+    rec: &Mutex<Session>,
+    vocab: &[&str],
+    crops: &[Mat],
+    batch_size: usize,
+) -> Result<Vec<(String, f32)>, AppError> {
+    let mut widths = Vec::with_capacity(crops.len());
+    for (index, crop) in crops.iter().enumerate() {
+        let size = crop.size()?;
+        let width = ((f64::from(size.width) * f64::from(REC_HEIGHT)
+            / f64::from(size.height.max(1)))
+        .round() as i32)
+            .clamp(1, REC_MAX_WIDTH);
+        widths.push((index, width));
+    }
+    widths.sort_unstable_by_key(|&(_, width)| width);
+    let mut recognized = vec![(String::new(), 0.0); crops.len()];
+    let mut start = 0;
+    while start < widths.len() {
+        let mut end = (start + batch_size).min(widths.len());
+        while end > start + 1 && widths[end - 1].1 > widths[start].1.saturating_mul(2) {
+            end -= 1;
+        }
+        let group = &widths[start..end];
+        let padded_width = group.last().expect("non-empty recognition batch").1;
+        let plane = (REC_HEIGHT * padded_width) as usize;
+        let mut data = vec![0.0_f32; group.len() * 3 * plane];
+        for (batch_index, &(crop_index, width)) in group.iter().enumerate() {
+            let mut resized = Mat::default();
+            imgproc::resize(
+                &crops[crop_index],
+                &mut resized,
+                Size::new(width, REC_HEIGHT),
+                0.0,
+                0.0,
+                imgproc::INTER_LINEAR,
+            )?;
+            let mut rgb = Mat::default();
+            imgproc::cvt_color_def(&resized, &mut rgb, imgproc::COLOR_BGR2RGB)?;
+            let pixels = rgb.data_typed::<Vec3b>()?;
+            let batch_base = batch_index * 3 * plane;
+            for (pixel_index, pixel) in pixels.iter().enumerate() {
+                let y = pixel_index / width as usize;
+                let x = pixel_index % width as usize;
+                for channel in 0..3 {
+                    data[batch_base + channel * plane + y * padded_width as usize + x] =
+                        (f32::from(pixel[channel]) - 127.5) / 127.5;
+                }
+            }
+        }
+        let (shape, out) = forward(
+            rec,
+            [group.len(), 3, REC_HEIGHT as usize, padded_width as usize],
+            data,
+        )?;
+        for (batch_index, &(crop_index, width)) in group.iter().enumerate() {
+            recognized[crop_index] =
+                decode_recognition(&out, &shape, batch_index, width, padded_width, vocab)?;
+        }
+        start = end;
+    }
+    Ok(recognized)
+}
+
+fn decode_recognition(
+    out: &[f32],
+    shape: &[i64],
+    batch_index: usize,
+    valid_width: i32,
+    padded_width: i32,
+    vocab: &[&str],
+) -> Result<(String, f32), AppError> {
+    let full_timesteps = shape[1] as usize;
+    let vocab_len = shape[2] as usize;
+    let timesteps = (((full_timesteps as i32) * valid_width + padded_width - 1) / padded_width)
+        .clamp(1, full_timesteps as i32) as usize;
+    let batch_offset = batch_index * full_timesteps * vocab_len;
+
+    let mut text = String::new();
+    let mut confidence_sum = 0.0_f32;
+    let mut confidence_count = 0_usize;
+    let mut previous_index = -1_i32;
+    for t in 0..timesteps {
+        let row = &out[batch_offset + t * vocab_len..batch_offset + (t + 1) * vocab_len];
+        let mut best_index = 0_i32;
+        let mut best_value = f32::MIN;
+        for (v, &value) in row.iter().enumerate() {
+            if value > best_value {
+                best_value = value;
+                best_index = v as i32;
+            }
+        }
+        if best_index != 0
+            && best_index != previous_index
+            && let Some(character) = vocab.get(best_index as usize)
+        {
+            text.push_str(character);
+            confidence_sum += best_value;
+            confidence_count += 1;
+        }
+        previous_index = best_index;
+    }
+
+    let confidence = if confidence_count == 0 {
+        0.0
+    } else {
+        confidence_sum / confidence_count as f32
+    };
+    Ok((text, confidence))
+}

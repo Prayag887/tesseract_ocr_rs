@@ -1,5 +1,2 @@
-/target
-scanned_document/*.jpg
 .venv_paddleocr/
-.cargo/config.toml
 passport-scan-service/.cargo/config.toml

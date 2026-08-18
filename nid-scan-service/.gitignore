@@ -1,0 +1,3 @@
+/target
+scanned_document/*.jpg
+.cargo/config.toml
