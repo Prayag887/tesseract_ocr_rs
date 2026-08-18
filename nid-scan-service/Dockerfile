@@ -24,17 +24,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG OPENCV_VERSION=5.0.0
 RUN git clone --branch ${OPENCV_VERSION} --depth 1 https://github.com/opencv/opencv.git /opencv-src
 
-# Only core/imgproc/imgcodecs/geometry/dnn are used by this project (see
-# .cargo/config.toml's OPENCV_LINK_LIBS), but no BUILD_LIST restriction is
-# applied — OpenCV 5's inter-module dependency graph isn't pinned down here,
-# and an unattended Docker build failing on a missed transitive dependency
-# is worse than the extra build time of the default module set. Python/Java/
-# apps/tests/docs/examples are dropped since nothing here touches them.
+# .cargo/config.toml's OPENCV_LINK_LIBS pulls in exactly four libs:
+# core, imgproc, imgcodecs, geometry. flann is geometry's one hard
+# dependency (see modules/geometry/CMakeLists.txt). Everything else in
+# OpenCV's default module set — dnn, calib3d, features2d, objdetect,
+# photo, stitching, video, videoio, gapi, ml, highgui — is dead weight
+# for this binary (ONNX inference goes through `ort`, not opencv::dnn),
+# and dnn alone is a large share of a full OpenCV build. Trimming the
+# list here is most of why this stage doesn't take half an hour.
 RUN cmake -S /opencv-src -B /opencv-build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=/usr/local \
     -DOPENCV_GENERATE_PKGCONFIG=ON \
     -DBUILD_SHARED_LIBS=ON \
+    -DBUILD_LIST=core,imgproc,imgcodecs,geometry,flann \
     -DBUILD_opencv_python2=OFF -DBUILD_opencv_python3=OFF \
     -DBUILD_JAVA=OFF -DBUILD_opencv_apps=OFF \
     -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_DOCS=OFF \

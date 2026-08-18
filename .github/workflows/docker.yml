@@ -1,0 +1,79 @@
+name: Docker images
+
+# Builds each service's own image from its own Dockerfile/context (see
+# docker-compose.yml's header comment on why they're independent builds).
+# PRs just build, to catch a broken Dockerfile before merge; pushes to
+# main/prod also publish to GHCR. Only linux/amd64 is built — that's what
+# both the Ubuntu and RHEL targets run, and adding arm64 would double every
+# OpenCV-from-source compile for a platform nothing here deploys to.
+on:
+  push:
+    branches: [prod, main, dev]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: nid-scan-service
+            context: ./nid-scan-service
+            image: ocr-nid-scan-service
+          - service: passport-scan-service
+            context: ./passport-scan-service
+            image: ocr-passport-scan-service
+          - service: citizenship-scan-service
+            context: ./citizenship_scanner
+            image: ocr-citizenship-scan-service
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # github.repository_owner isn't lowercased (this repo's owner has
+      # capitals), but GHCR rejects any uppercase in the image path.
+      - name: Lowercase image owner
+        id: owner
+        run: echo "name=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ steps.owner.outputs.name }}/${{ matrix.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+
+      # The gha cache backend keys on Dockerfile content, so the OpenCV
+      # source build only re-runs when a Dockerfile actually changes —
+      # everyday pushes just replay cached layers up to the `cargo build`
+      # step. Scoped per service so one image's cache can't evict another's.
+      - name: Build ${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}

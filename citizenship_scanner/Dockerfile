@@ -18,11 +18,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG OPENCV_VERSION=5.0.0
 RUN git clone --branch ${OPENCV_VERSION} --depth 1 https://github.com/opencv/opencv.git /opencv-src
 
+# BUILD_LIST trimmed to what .cargo/config.toml's OPENCV_LINK_LIBS actually
+# links (core, imgproc, imgcodecs, geometry) plus flann, geometry's one
+# hard dependency — see the NID service's Dockerfile for the full reasoning.
+# ONNX inference goes through `ort`, not opencv::dnn, so dnn and the rest
+# of the default module set (calib3d, features2d, objdetect, photo,
+# stitching, video, videoio, gapi, ml, highgui) aren't built at all.
 RUN cmake -S /opencv-src -B /opencv-build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=/usr/local \
     -DOPENCV_GENERATE_PKGCONFIG=ON \
     -DBUILD_SHARED_LIBS=ON \
+    -DBUILD_LIST=core,imgproc,imgcodecs,geometry,flann \
     -DBUILD_opencv_python2=OFF -DBUILD_opencv_python3=OFF \
     -DBUILD_JAVA=OFF -DBUILD_opencv_apps=OFF \
     -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_DOCS=OFF \

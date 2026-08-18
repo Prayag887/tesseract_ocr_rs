@@ -33,7 +33,10 @@ services:
       # them) leaves the container serving the original file forever, with no
       # error to say so. Mounting the dir also shadows the image's stock
       # default.conf, which would otherwise also try to listen on 80.
-      - ./nginx:/etc/nginx/conf.d:ro
+      # The trailing `z` relabels the host dir for SELinux (a no-op on
+      # Ubuntu, which doesn't enforce it, but without it nginx gets a
+      # silent permission denied reading conf.d on RHEL, which does).
+      - ./nginx:/etc/nginx/conf.d:ro,z
     depends_on:
       # Both images define a HEALTHCHECK, so the gateway waits until each
       # backend actually answers /health rather than merely having started —
