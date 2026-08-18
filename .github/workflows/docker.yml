@@ -124,9 +124,15 @@ jobs:
           echo "--- container state ---"
           docker compose ps
 
+          # The trimming runs INSIDE the container on purpose. Piping
+          # `docker compose exec` into `head` on the host lets head exit first,
+          # which closes the pipe, kills the exec with EPIPE and makes it
+          # return 255 — and `set -o pipefail` then fails the whole step even
+          # though the command worked fine. Keeping the pipe inside one `sh -c`
+          # means the host only ever sees the final, complete output.
           echo "--- the images are actually RHEL ---"
-          docker compose exec -T nid-scan-service cat /etc/os-release | head -2
-          docker compose exec -T nid-scan-service ldd --version | head -1
+          docker compose exec -T nid-scan-service sh -c \
+            'grep -E "^(NAME|VERSION)=" /etc/os-release; ldd --version | head -1'
 
           # Ask compose for the published port rather than assuming one: the
           # committed .env overrides GATEWAY_HOST_PORT (3006 today, not the
@@ -134,6 +140,25 @@ jobs:
           # a connection refused that looks nothing like its actual cause.
           base="http://localhost:$(docker compose port gateway 80 | cut -d: -f2)"
           echo "gateway: $base"
+
+          # `up --wait` only waits on services that define a HEALTHCHECK, and
+          # the nginx gateway does not — compose calls it started the moment
+          # the process execs, which is why it shows "Up Less than a second"
+          # while the backends are already healthy. Without this poll the
+          # first curl can lose the race and report a connection refused that
+          # looks like a routing bug.
+          echo "--- waiting for the gateway to accept connections ---"
+          for i in $(seq 1 30); do
+            if curl -fsS --max-time 5 -o /dev/null "$base/nid/health" 2>/dev/null; then
+              echo "gateway ready after ${i}s"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "gateway never accepted connections" >&2
+              exit 1
+            fi
+            sleep 1
+          done
 
           echo "--- health through the gateway ---"
           for svc in nid passport citizenship; do
