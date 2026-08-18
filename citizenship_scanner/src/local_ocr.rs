@@ -8,12 +8,9 @@ use opencv::{geometry, imgcodecs, imgproc};
 use ort::session::Session;
 use ort::value::Tensor;
 
-use crate::binarize;
-use crate::docshadow;
 use crate::error::AppError;
 use crate::fields::{self, CitizenshipDocument, OcrLine};
 use crate::preprocess;
-use crate::upscale;
 
 // Detection is script-agnostic (unlike recognition, which has no larger
 // Devanagari model available — see fields.rs/local_ocr.rs history), so it's
@@ -62,7 +59,25 @@ const MIN_PREPROCESS_SHORT_SIDE: i32 = 800;
 // Same PP-OCRv5_mobile_det hyperparameters the other two services use — the
 // detection model is script-agnostic.
 const DET_LIMIT_SIDE_LEN: i32 = 64;
-const DET_MAX_SIDE_LIMIT: i32 = 4000;
+/// Hard ceiling on the longest side the detector sees, and with it the
+/// single biggest driver of per-request memory: cost scales with the
+/// pixel count of this clamped image, not with the uploaded file. A
+/// 2048x1405 crop upscaled 3x is 6144x4215, clamped here to 4000x2752 =
+/// 11.0 MP against the 2.9 MP the un-upscaled crop would have been.
+/// Measured peak RSS for one request runs ~1.8 GB with no upscaling and
+/// ~3.8 GB with it, almost entirely from this stage.
+///
+/// Tunable at runtime (`OCR_DET_MAX_SIDE`) specifically so the
+/// accuracy/memory trade can be measured against real scans without a
+/// rebuild — lowering it shrinks the detector's working set roughly with
+/// the square of the ratio, at the cost of resolving smaller text.
+fn det_max_side_limit() -> i32 {
+    std::env::var("OCR_DET_MAX_SIDE")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(4000)
+        .clamp(320, 8000)
+}
 const DET_THRESH: f64 = 0.3;
 const DET_BOX_THRESH: f32 = 0.6;
 const DET_UNCLIP_RATIO: f32 = 1.5;
@@ -93,24 +108,6 @@ pub struct LocalOcrEngine {
     /// — kept configurable in case a particular scan reads better without
     /// it (e.g. an already-clean, non-watermarked photocopy).
     preprocess_enabled: bool,
-    /// `None` only when explicitly disabled with
-    /// `CITIZENSHIP_OCR_DOCSHADOW=false` — see
-    /// `docshadow.rs`. Runs first in the optional-pipeline order (crop ->
-    /// docshadow -> upscale -> binarize -> detect): shadow/illumination
-    /// cleanup is meant to feed a *cleaner* image into upscaling, not the
-    /// other way around.
-    docshadow: Option<Mutex<Session>>,
-    /// `None` only when explicitly disabled with
-    /// `CITIZENSHIP_OCR_UPSCALE=false` — see `upscale.rs`.
-    upscale: Option<Mutex<Session>>,
-    /// Off by default even when upscaling is on — see `binarize.rs`'s
-    /// module doc. Tested against a real scan both ways (inverted and
-    /// not): both made recognition *worse* than the plain upscaled color
-    /// image, introducing several garbage-string lines the color image
-    /// didn't have. Kept as its own flag, not folded into the upscale
-    /// path, specifically so it stays testable without dragging upscale's
-    /// results down by default.
-    binarize_enabled: bool,
     /// Where the OCR-input debug image gets written (see `extract_blocking`)
     /// — not the crop/original, which callers don't need kept around at all.
     output_dir: std::path::PathBuf,
@@ -151,37 +148,6 @@ impl LocalOcrEngine {
             .and_then(|value| value.parse::<bool>().ok())
             .unwrap_or(true);
 
-        // Enabled by default. Measured across all six real scans, total
-        // fields recovered over the three card pairs: 36 with upscale
-        // alone, 42 with this, 43 with a full-resolution pass -- so the
-        // shadow pass is worth roughly six fields, and the reduced-
-        // resolution gain-map form in `docshadow.rs` keeps nearly all of
-        // that. The full-resolution form is not an option regardless of
-        // its one extra field: it drove the container to ~6 GiB and got it
-        // SIGKILLed (exit 137) partway through a request, which surfaced
-        // as a 502 from the gateway on any crop around 2048x1405.
-        let docshadow_enabled = std::env::var("CITIZENSHIP_OCR_DOCSHADOW")
-            .ok()
-            .and_then(|value| value.parse::<bool>().ok())
-            .unwrap_or(true);
-        let docshadow = if docshadow_enabled {
-            Some(Mutex::new(Session::builder()?.commit_from_file(docshadow::DOCSHADOW_MODEL_PATH)?))
-        } else {
-            None
-        };
-        let upscale_enabled = std::env::var("CITIZENSHIP_OCR_UPSCALE")
-            .ok()
-            .and_then(|value| value.parse::<bool>().ok())
-            .unwrap_or(true);
-        let upscale = if upscale_enabled {
-            Some(Mutex::new(Session::builder()?.commit_from_file(upscale::UPSCALE_MODEL_PATH)?))
-        } else {
-            None
-        };
-        let binarize_enabled = std::env::var("CITIZENSHIP_OCR_BINARIZE")
-            .ok()
-            .and_then(|value| value.parse::<bool>().ok())
-            .unwrap_or(false);
 
         Ok(Self {
             det: Mutex::new(det),
@@ -192,9 +158,6 @@ impl LocalOcrEngine {
             orientation_batch_size,
             recognition_batch_size,
             preprocess_enabled,
-            docshadow,
-            upscale,
-            binarize_enabled,
             output_dir,
         })
     }
@@ -213,7 +176,7 @@ impl LocalOcrEngine {
         let debug = std::env::var("OCR_DEBUG_TIMING").is_ok();
         let t0 = std::time::Instant::now();
         let buf = Vector::<u8>::from_slice(image);
-        let mut bgr = imgcodecs::imdecode(&buf, imgcodecs::IMREAD_COLOR).map_err(AppError::Decode)?;
+        let bgr = imgcodecs::imdecode(&buf, imgcodecs::IMREAD_COLOR).map_err(AppError::Decode)?;
         if bgr.empty() {
             return Err(AppError::EmptyImage);
         }
@@ -233,42 +196,7 @@ impl LocalOcrEngine {
             }
         };
 
-        // Runs before upscale/binarize/preprocess, on the crop straight out
-        // of scanner.rs — shadow/illumination cleanup is meant to hand a
-        // clearer image to whatever runs next, not the other way around.
-        if let Some(session) = &self.docshadow {
-            let t_shadow = std::time::Instant::now();
-            bgr = docshadow::remove_shadow(session, &bgr)?;
-            if debug {
-                eprintln!("[ocr_timing] docshadow: {:?}", t_shadow.elapsed());
-            }
-            dump(&bgr, "docshadow");
-        }
-
-        // Upscale+binarize (see upscale.rs/binarize.rs) and the old
-        // adaptive-threshold preprocess (see preprocess.rs) are
-        // alternative strategies for the same problem — a crop that reads
-        // poorly as-is — not a pipeline to chain: binarizing an
-        // already-binarized image is pointless, and the two were tuned
-        // against different failure modes (uneven lighting/watermark vs. a
-        // too-small crop). Upscale wins when both are configured, since
-        // it's the one actually under active testing right now.
-        let cleaned = if let Some(session) = &self.upscale {
-            let t_up = std::time::Instant::now();
-            let upscaled = upscale::upscale_3x(session, &bgr)?;
-            if debug {
-                eprintln!("[ocr_timing] upscale: {:?}", t_up.elapsed());
-            }
-            dump(&upscaled, "upscaled");
-
-            if self.binarize_enabled {
-                let binarized = binarize::invert_binarize(&upscaled)?;
-                dump(&binarized, "inverted_binary");
-                binarized
-            } else {
-                upscaled
-            }
-        } else {
+        let cleaned = {
             let crop_size = bgr.size()?;
             let short_side = crop_size.width.min(crop_size.height);
             // Citizenship certificates are printed on watermarked security
@@ -473,8 +401,8 @@ fn det_resize_dims(height: i32, width: i32) -> (i32, i32) {
     }
     let mut resize_h = (f64::from(height) * ratio) as i32;
     let mut resize_w = (f64::from(width) * ratio) as i32;
-    if f64::from(resize_h.max(resize_w)) > f64::from(DET_MAX_SIDE_LIMIT) {
-        let cap = f64::from(DET_MAX_SIDE_LIMIT) / f64::from(resize_h.max(resize_w));
+    if f64::from(resize_h.max(resize_w)) > f64::from(det_max_side_limit()) {
+        let cap = f64::from(det_max_side_limit()) / f64::from(resize_h.max(resize_w));
         resize_h = (f64::from(resize_h) * cap) as i32;
         resize_w = (f64::from(resize_w) * cap) as i32;
     }

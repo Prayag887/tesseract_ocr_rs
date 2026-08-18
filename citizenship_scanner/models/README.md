@@ -17,16 +17,15 @@
   recognizer. No larger Devanagari recognition model exists in PaddleOCR's
   model zoo to upgrade to (PP-OCRv6 dropped Devanagari from its unified
   recognizer).
-- `super-resolution-10.onnx` — optional pre-detection upscaler for crops
-  under `MIN_PREPROCESS_SHORT_SIDE`, gated behind `CITIZENSHIP_OCR_UPSCALE`
-  (default off — see `src/upscale.rs`). The classic ESPCN-style sub-pixel
-  CNN from the official ONNX Model Zoo, downloaded from
-  `onnxmodelzoo/super-resolution-10` on Hugging Face (Apache 2.0). Fixed
-  224x224 input, 3x upscale, Y-channel (luma) only — `upscale.rs` tiles the
-  crop into 224x224 blocks and resizes Cr/Cb separately. Tested against two
-  real scans before wiring in: makes the image visibly sharper but is *not*
-  a clear OCR-accuracy win — it changes which misreads the recognizer
-  makes rather than removing them, and on one real front-page scan it
-  caused a wrong-attribution bug (a relative's name matched as the
-  holder's) that hadn't occurred without it. Left disabled by default for
-  that reason; flip `CITIZENSHIP_OCR_UPSCALE=true` to test it yourself.
+
+Removed models (kept here as a record so they aren't re-added without the
+measurements that argued against them):
+
+- `super-resolution-10.onnx` (ESPCN 3x) and `docshadow_sd7k.onnx`
+  (DocShadow, 114 MB) were both trialled as pre-detection enhancement.
+  Scored against a hand-checked ground truth over three real card pairs
+  (48 fields): neither models 35/48, upscale alone 33/48, docshadow alone
+  33/48, both together 40/48 — so each was a *net loss* on its own and the
+  pair bought +5 fields. The cost was ~2x peak RSS (3.8 GB vs 1.8 GB) and
+  ~7x latency, because upscaling triples the image and the detector then
+  works on 11.0 MP instead of 2.9 MP. Removed on that trade.

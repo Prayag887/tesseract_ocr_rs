@@ -1,12 +1,9 @@
-mod binarize;
-mod docshadow;
 mod error;
 mod fields;
 mod local_ocr;
 mod preprocess;
 mod routes;
 mod scanner;
-mod upscale;
 
 use std::sync::Arc;
 
