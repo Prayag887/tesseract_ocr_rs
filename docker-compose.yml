@@ -66,6 +66,14 @@ services:
       # freed memory ends up stranded across arenas instead of reused.
       # Capping at 2 measured ~35 MB lower RSS with no latency change.
       MALLOC_ARENA_MAX: "2"
+      # glibc's mmap threshold is dynamic by default: it ratchets up to 32 MB as
+      # it observes large blocks being freed, after which almost nothing is
+      # returned to the OS. ONNX Runtime's activation buffers are exactly that
+      # shape, so RSS climbed with every large image and never came back down.
+      # Setting the threshold explicitly also disables the ratchet, so those
+      # buffers are munmap'd on free and memory plateaus instead of growing.
+      MALLOC_MMAP_THRESHOLD_: "131072"
+      MALLOC_TRIM_THRESHOLD_: "131072"
       # Set to any value to log every recognized OCR line at INFO level.
       # OCR_DEBUG_LINES: "1"
       # SCAN_DEBUG_TIMING: "1"
@@ -91,6 +99,14 @@ services:
       MRZ_OCR_MIN_CONFIDENCE: "${MRZ_OCR_MIN_CONFIDENCE:-0.45}"
       # See the nid service above.
       MALLOC_ARENA_MAX: "2"
+      # glibc's mmap threshold is dynamic by default: it ratchets up to 32 MB as
+      # it observes large blocks being freed, after which almost nothing is
+      # returned to the OS. ONNX Runtime's activation buffers are exactly that
+      # shape, so RSS climbed with every large image and never came back down.
+      # Setting the threshold explicitly also disables the ratchet, so those
+      # buffers are munmap'd on free and memory plateaus instead of growing.
+      MALLOC_MMAP_THRESHOLD_: "131072"
+      MALLOC_TRIM_THRESHOLD_: "131072"
       # OCR_DEBUG_LINES: "1"
       # OCR_DEBUG_TIMING: "1"
       # SCAN_DEBUG_TIMING: "1"
@@ -113,11 +129,27 @@ services:
       - "3004"
     environment:
       CITIZENSHIP_OCR_MIN_CONFIDENCE: "${CITIZENSHIP_OCR_MIN_CONFIDENCE:-0.45}"
+      # Detection input cap. Was 4000 (the code default), which on this
+      # service's 62 MB PP-OCRv6_medium_det peaked around 900 MB of transient
+      # activation memory for a single request. Verified accuracy-neutral
+      # before lowering: at 1600 all six citizenship test images extract
+      # byte-identical output to 4000. 960 does NOT — it changes
+      # test_img1-front and test3-front — so 1600 is the floor, not a value to
+      # tune down further without re-running that comparison.
+      OCR_DET_MAX_SIDE: "${OCR_DET_MAX_SIDE:-1600}"
       # Watermark/lighting cleanup (preprocess.rs) runs before OCR by
       # default — set to "false" to compare against the raw crop.
       CITIZENSHIP_OCR_PREPROCESS: "${CITIZENSHIP_OCR_PREPROCESS:-true}"
       # See the nid service above.
       MALLOC_ARENA_MAX: "2"
+      # glibc's mmap threshold is dynamic by default: it ratchets up to 32 MB as
+      # it observes large blocks being freed, after which almost nothing is
+      # returned to the OS. ONNX Runtime's activation buffers are exactly that
+      # shape, so RSS climbed with every large image and never came back down.
+      # Setting the threshold explicitly also disables the ratchet, so those
+      # buffers are munmap'd on free and memory plateaus instead of growing.
+      MALLOC_MMAP_THRESHOLD_: "131072"
+      MALLOC_TRIM_THRESHOLD_: "131072"
       # OCR_DEBUG_LINES: "1"
       # OCR_DEBUG_TIMING: "1"
       # SCAN_DEBUG_TIMING: "1"

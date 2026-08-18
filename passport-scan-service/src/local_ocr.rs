@@ -6,6 +6,7 @@ use opencv::core::{
 use opencv::prelude::*;
 use opencv::{geometry, imgcodecs, imgproc};
 use ort::session::Session;
+use ort::session::builder::PrepackedWeights;
 use ort::value::Tensor;
 
 use serde::Serialize;
@@ -99,8 +100,9 @@ pub struct MrzOcrEngine {
 
 impl MrzOcrEngine {
     pub fn load() -> Result<Self, AppError> {
-        let det = Session::builder()?.commit_from_file(DET_MODEL_PATH)?;
-        let textline_ori = Session::builder()?.commit_from_file(TEXTLINE_ORI_MODEL_PATH)?;
+        let det = crate::ort_config::session_builder()?.commit_from_file(DET_MODEL_PATH)?;
+        let textline_ori =
+            crate::ort_config::session_builder()?.commit_from_file(TEXTLINE_ORI_MODEL_PATH)?;
         let dict_text = std::fs::read_to_string(REC_DICT_PATH).map_err(AppError::Io)?;
         let mut rec_vocab = Vec::new();
         rec_vocab.push(String::new()); // CTC blank
@@ -120,10 +122,17 @@ impl MrzOcrEngine {
         let recognition_workers =
             env_usize("OCR_RECOGNITION_WORKERS", default_recognition_workers())
                 .clamp(1, MAX_RECOGNITION_WORKERS);
+        // One prepacked-weights container shared by the whole pool: the
+        // workers are N sessions over the *same* file, so without this each
+        // one repacks and stores identical weight buffers. Dropped at the end
+        // of `load` — ORT keeps the buffers alive for as long as the sessions
+        // built from it need them.
+        let rec_weights = PrepackedWeights::new();
         let mut rec = Vec::with_capacity(recognition_workers);
         for _ in 0..recognition_workers {
             rec.push(Mutex::new(
-                Session::builder()?.commit_from_file(REC_MODEL_PATH)?,
+                crate::ort_config::rec_session_builder(&rec_weights)?
+                    .commit_from_file(REC_MODEL_PATH)?,
             ));
         }
         tracing::info!(recognition_workers, "OCR recognition workers configured");

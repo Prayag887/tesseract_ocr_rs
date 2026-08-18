@@ -58,7 +58,7 @@ const HEATMAP_THRESHOLD: f64 = 0.3;
 
 impl DocDetector {
     pub fn load() -> Result<Self, AppError> {
-        let net = Session::builder()?.commit_from_file(MODEL_PATH)?;
+        let net = crate::ort_config::session_builder()?.commit_from_file(MODEL_PATH)?;
         Ok(Self(Mutex::new(net)))
     }
 

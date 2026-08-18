@@ -1,6 +1,7 @@
 mod error;
 mod fields;
 mod local_ocr;
+mod ort_config;
 mod preprocess;
 mod routes;
 mod scanner;
@@ -25,6 +26,10 @@ const DEFAULT_PORT: u16 = 3004;
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+
+    // Before any session is built — `ort` installs a default environment
+    // lazily on first use, and this is a no-op afterwards.
+    ort_config::init_runtime().expect("failed to configure ONNX Runtime");
 
     let output_dir = std::path::PathBuf::from("scanned_document");
     std::fs::create_dir_all(&output_dir).expect("failed to create scanned_document directory");
