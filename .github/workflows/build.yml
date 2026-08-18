@@ -26,20 +26,31 @@ jobs:
           g++ --version
 
       - name: Install build deps
-        # Runner-side apt has no timeout by default, so a stalled connection
-        # to one of Ubuntu's mirrors (azure.archive.ubuntu.com has had
-        # outages) just hangs instead of failing — these options bound each
-        # attempt and retry instead of sitting there for the rest of the job.
+        # apt has no wall-clock cap of its own — a mirror that trickles data
+        # slowly (rather than dropping the connection outright) never hits
+        # Acquire::http::Timeout, which only fires on a dead-quiet socket.
+        # azure.archive.ubuntu.com has been slow enough to do exactly that,
+        # so `timeout` here is what actually bounds the step: 3 tries at
+        # 3 minutes each, hard-killed and retried on the next attempt rather
+        # than left to crawl for the rest of the job.
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends \
-            cmake ninja-build git pkg-config \
-            clang libclang-dev llvm-dev \
-            libjpeg-dev libpng-dev libtiff-dev libwebp-dev libopenexr-dev \
-            libavcodec-dev libavformat-dev libswscale-dev libavutil-dev \
-            zlib1g-dev
+          for i in 1 2 3; do
+            sudo timeout 180 apt-get update && break
+            echo "apt-get update attempt $i timed out or failed, retrying"
+            sleep 5
+          done
+          for i in 1 2 3; do
+            sudo timeout 180 apt-get install -y --no-install-recommends \
+              cmake ninja-build git pkg-config \
+              clang libclang-dev llvm-dev \
+              libjpeg-dev libpng-dev libtiff-dev libwebp-dev libopenexr-dev \
+              libavcodec-dev libavformat-dev libswscale-dev libavutil-dev \
+              zlib1g-dev && break
+            echo "apt-get install attempt $i timed out or failed, retrying"
+            sleep 5
+          done
 
       - name: Locate libclang
         run: |
