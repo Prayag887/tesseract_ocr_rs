@@ -34,6 +34,7 @@ RUN cmake -S /opencv-src -B /opencv-build -G Ninja \
     -DCMAKE_INSTALL_LIBDIR=lib64 \
     -DOPENCV_GENERATE_PKGCONFIG=ON \
     -DBUILD_SHARED_LIBS=ON \
+    -DBUILD_LIST=core,imgproc,imgcodecs,geometry \
     -DBUILD_opencv_python2=OFF -DBUILD_opencv_python3=OFF \
     -DBUILD_JAVA=OFF -DBUILD_opencv_apps=OFF \
     -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_DOCS=OFF \

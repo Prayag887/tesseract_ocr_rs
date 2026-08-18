@@ -19,6 +19,30 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: rockylinux/rockylinux:10
+      # PATH must be declared explicitly. `rockylinux/rockylinux:10` ships a
+      # config Env of just ["container=oci"] — no PATH at all. `docker run`
+      # papers over that because the daemon injects a default, but the Actions
+      # runner builds its `docker exec` environment from the image config, so
+      # it starts with no PATH baseline. The moment any action calls
+      # core.addPath() (GITHUB_PATH), the runner sets PATH to
+      # "<added>:<what it thinks PATH was>" — i.e. just "<added>" — and every
+      # later step dies with `exec: "bash": executable file not found in
+      # $PATH`. Declaring PATH here gives addPath something to prepend to.
+      #
+      # /opt/rust/cargo/bin is baked in here rather than added later via
+      # GITHUB_PATH, so the toolchain is reachable without relying on the
+      # addPath mechanism that broke above.
+      #
+      # Rust deliberately lives under /opt, NOT /usr/local as in the
+      # Dockerfiles: the OpenCV step below caches all of /usr/local, so a
+      # CARGO_HOME inside it would get archived into the OpenCV cache and
+      # later restore a stale toolchain and registry over the pinned one.
+      # Only the toolchain VERSION needs to match the Dockerfiles; the
+      # install prefix does not.
+      env:
+        PATH: /opt/rust/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        RUSTUP_HOME: /opt/rust/rustup
+        CARGO_HOME: /opt/rust/cargo
     strategy:
       fail-fast: false
       matrix:
@@ -72,7 +96,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /usr/local
-          key: opencv5-rocky10-v1
+          # Bump this suffix whenever the cmake flags below change. The key
+          # does not hash them, so a stale cache would otherwise restore an
+          # OpenCV built with the OLD flags and the change would never take
+          # effect — v2 is the BUILD_LIST-restricted build.
+          key: opencv5-rocky10-v2
 
       # WITH_FFMPEG/GTK/V4L are off because RHEL ships no ffmpeg or V4L devel
       # packages in its base repos (they need RPM Fusion) and nothing here
@@ -89,6 +117,7 @@ jobs:
             -DCMAKE_INSTALL_LIBDIR=lib64 \
             -DOPENCV_GENERATE_PKGCONFIG=ON \
             -DBUILD_SHARED_LIBS=ON \
+            -DBUILD_LIST=core,imgproc,imgcodecs,geometry \
             -DBUILD_opencv_python2=OFF -DBUILD_opencv_python3=OFF \
             -DBUILD_JAVA=OFF -DBUILD_opencv_apps=OFF \
             -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_DOCS=OFF \
@@ -110,7 +139,20 @@ jobs:
         run: |
           echo "PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig" >> "$GITHUB_ENV"
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Installed via rustup rather than dtolnay/rust-toolchain for two
+      # reasons. First, that action calls core.addPath(), which is what
+      # collapsed PATH in this container (see the container env above).
+      # Second, it defaults to `stable`, while the Dockerfiles pin
+      # RUST_VERSION=1.90.0 — so CI was testing a different toolchain than
+      # the images actually build with. Keep this version in step with the
+      # ARG RUST_VERSION in all three Dockerfiles.
+      - name: Install Rust 1.90.0
+        working-directory: /
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.90.0
+          rustc --version
+          cargo --version
 
       - uses: Swatinem/rust-cache@v2
         with:

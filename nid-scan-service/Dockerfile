@@ -44,12 +44,20 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 ARG OPENCV_VERSION=5.0.0
 RUN git clone --branch ${OPENCV_VERSION} --depth 1 https://github.com/opencv/opencv.git /opencv-src
 
-# Only core/imgproc/imgcodecs/geometry/dnn are used by this project (see
-# .cargo/config.toml's OPENCV_LINK_LIBS), but no BUILD_LIST restriction is
-# applied — OpenCV 5's inter-module dependency graph isn't pinned down here,
-# and an unattended Docker build failing on a missed transitive dependency
-# is worse than the extra build time of the default module set. Python/Java/
-# apps/tests/docs/examples are dropped since nothing here touches them.
+# BUILD_LIST is restricted to the four modules OPENCV_LINK_LIBS actually
+# links (see .cargo/config.toml). Note that dnn is NOT among them: every
+# `dnn::` mention left in the Rust sources is in a comment, and ONNX
+# inference goes through `ort` (ONNX Runtime), not OpenCV. Dropping dnn also
+# drops its protobuf dependency, which is a large part of the build.
+#
+# An earlier revision deliberately built the full default module set for
+# fear of tripping over OpenCV 5's inter-module dependency graph. That fear
+# turned out to be unfounded: BUILD_LIST resolves transitive dependencies
+# itself — asking for `geometry` pulls in `flann` automatically. Measured on
+# a 4-core box, this cuts the compile from 876 ninja targets to 362 (~4 min).
+#
+# Python/Java/apps/tests/docs/examples are dropped since nothing here uses
+# them.
 #
 # WITH_FFMPEG/WITH_GTK/WITH_V4L are off because RHEL ships no ffmpeg or V4L
 # devel packages in its base repos (they need RPM Fusion), and nothing here
@@ -65,6 +73,7 @@ RUN cmake -S /opencv-src -B /opencv-build -G Ninja \
     -DCMAKE_INSTALL_LIBDIR=lib64 \
     -DOPENCV_GENERATE_PKGCONFIG=ON \
     -DBUILD_SHARED_LIBS=ON \
+    -DBUILD_LIST=core,imgproc,imgcodecs,geometry \
     -DBUILD_opencv_python2=OFF -DBUILD_opencv_python3=OFF \
     -DBUILD_JAVA=OFF -DBUILD_opencv_apps=OFF \
     -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_DOCS=OFF \
