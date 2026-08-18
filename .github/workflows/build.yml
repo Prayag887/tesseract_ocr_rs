@@ -45,7 +45,7 @@ jobs:
             pkgconf-pkg-config \
             clang clang-devel llvm-devel \
             libjpeg-turbo-devel libpng-devel libtiff-devel libwebp-devel openexr-devel \
-            zlib-ng-compat-devel
+            zlib-ng-compat-devel openssl-devel
 
       - uses: actions/checkout@v4
 

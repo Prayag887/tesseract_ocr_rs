@@ -24,7 +24,7 @@ RUN dnf -y install dnf-plugins-core \
         gcc gcc-c++ make cmake ninja-build git pkgconf-pkg-config \
         clang clang-devel llvm-devel \
         libjpeg-turbo-devel libpng-devel libtiff-devel libwebp-devel openexr-devel \
-        zlib-ng-compat-devel \
+        zlib-ng-compat-devel openssl-devel \
     && dnf clean all && rm -rf /var/cache/dnf
 
 # The opencv crate generates its bindings with bindgen, which dlopens
