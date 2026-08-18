@@ -346,7 +346,7 @@ pub fn extract(lines: &[OcrLine]) -> CitizenshipDocument {
     let bs_month = devanagari_number_after(lines, "महिना");
     let bs_day = devanagari_number_after(lines, "गते");
     doc.date_of_birth_bs = match (bs_year, bs_month, bs_day) {
-        (Some(y), Some(m), Some(d)) => Some(format!("{y}/{m:0>2}/{d:0>2}")),
+        (Some(y), Some(m), Some(d)) => bs_date(&y, &m, &d),
         // The three parts print on one row ("साल: २०५६ महिना: ०७ गते: २३"),
         // so when only the day's label is the one that got mangled — "गते"
         // read as "वत्ते" on a real scan, too far off for fuzzy matching —
@@ -578,7 +578,22 @@ fn bs_date_from_row(lines: &[OcrLine]) -> Option<String> {
     if year.len() != 4 {
         return None;
     }
-    Some(format!("{year}/{month:0>2}/{day:0>2}"))
+    bs_date(year, month, day)
+}
+
+/// Formats a Bikram Sambat date, rejecting component values the calendar
+/// cannot produce. A misread digit otherwise yields a confidently wrong
+/// but well-formed date — a real scan read the month of "साल: २०६० महिना:
+/// १०" as `90`, giving "2060/90/26", which is worse than returning
+/// nothing because it looks parseable to whatever consumes it. BS months
+/// run 1-12 and days 1-32 (the longest BS month has 32 days).
+fn bs_date(year: &str, month: &str, day: &str) -> Option<String> {
+    let month_num: u32 = month.parse().ok()?;
+    let day_num: u32 = day.parse().ok()?;
+    if !(1..=12).contains(&month_num) || !(1..=32).contains(&day_num) {
+        return None;
+    }
+    Some(format!("{year}/{month_num:02}/{day_num:02}"))
 }
 
 /// Parses a Bikram Sambat date's digits out of raw OCR text and reformats

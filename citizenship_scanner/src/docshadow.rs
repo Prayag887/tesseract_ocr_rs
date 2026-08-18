@@ -24,7 +24,7 @@
 //!    small and multiplying it into the original pixels keeps text at
 //!    native sharpness while still removing the shadow.
 
-use opencv::core::{self, Mat, MatTraitConst, Size, Vec3b, Vec3f};
+use opencv::core::{Mat, MatTraitConst, Size, Vec3b, Vec3f};
 use opencv::imgproc;
 use opencv::prelude::*;
 use ort::session::Session;

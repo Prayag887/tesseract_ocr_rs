@@ -151,6 +151,15 @@ impl LocalOcrEngine {
             .and_then(|value| value.parse::<bool>().ok())
             .unwrap_or(true);
 
+        // Enabled by default. Measured across all six real scans, total
+        // fields recovered over the three card pairs: 36 with upscale
+        // alone, 42 with this, 43 with a full-resolution pass -- so the
+        // shadow pass is worth roughly six fields, and the reduced-
+        // resolution gain-map form in `docshadow.rs` keeps nearly all of
+        // that. The full-resolution form is not an option regardless of
+        // its one extra field: it drove the container to ~6 GiB and got it
+        // SIGKILLed (exit 137) partway through a request, which surfaced
+        // as a 502 from the gateway on any crop around 2048x1405.
         let docshadow_enabled = std::env::var("CITIZENSHIP_OCR_DOCSHADOW")
             .ok()
             .and_then(|value| value.parse::<bool>().ok())
