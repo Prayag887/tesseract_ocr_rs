@@ -73,6 +73,28 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      # citizenship_scanner (alone of the three) commits a .cargo/config.toml
+      # whose [env] table hardcodes macOS/homebrew absolute paths:
+      #   OPENCV_INCLUDE_PATHS = /opt/homebrew/opt/opencv/include/opencv5
+      #   OPENCV_LINK_PATHS    = /opt/homebrew/opt/opencv/lib
+      #   LIBCLANG_PATH        = /Library/Developer/CommandLineTools/usr/lib
+      #
+      # Cargo's [env] yields to real environment variables unless the entry
+      # sets force = true, so LIBCLANG_PATH and PKG_CONFIG_PATH (both exported
+      # by this job) win. Nothing here exports OPENCV_*, though, so those
+      # homebrew paths took effect and the opencv build script failed every
+      # probe with "Could not get OpenCV version from include_paths" —
+      # searching a macOS prefix that does not exist on this runner.
+      #
+      # The Dockerfiles never hit this because they copy only
+      # Cargo.toml/Cargo.lock/src/models and deliberately leave .cargo/ out.
+      # Deleting it from the ephemeral checkout makes CI match that, and lets
+      # pkg-config discover the OpenCV built above (which is also how the
+      # other two crates already resolve it). No-op once the repo drops the
+      # committed file.
+      - name: Ignore the macOS-only .cargo/config.toml
+        run: rm -f .cargo/config.toml
+
       - name: Report OS/toolchain
         run: |
           cat /etc/os-release
