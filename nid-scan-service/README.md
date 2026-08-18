@@ -21,6 +21,37 @@ Open <http://127.0.0.1:3000>.
 (`DYLD_FALLBACK_LIBRARY_PATH` is a macOS-only requirement for OpenCV's linker
 to find `libclang`; drop it on Linux.)
 
+### Building natively on RHEL / Rocky
+
+Rocky 10 is the floor, not a preference: `ort` downloads a prebuilt
+`libonnxruntime` that needs glibc >= 2.38 and GCC >= 13, and Rocky 9 ships
+glibc 2.34 / GCC 11. Two package names differ from the Debian equivalents —
+zlib is `zlib-ng-compat-devel` (there is no `zlib-devel` on RHEL 10), and
+`clang-devel`, `llvm-devel` and `openexr-devel` live in CRB, which is
+disabled by default:
+
+```sh
+sudo dnf -y install dnf-plugins-core
+sudo dnf config-manager --set-enabled crb
+sudo dnf -y install gcc gcc-c++ make cmake ninja-build git pkgconf-pkg-config \
+  clang clang-devel llvm-devel \
+  libjpeg-turbo-devel libpng-devel libtiff-devel libwebp-devel openexr-devel \
+  zlib-ng-compat-devel
+export LIBCLANG_PATH=/usr/lib64
+```
+
+OpenCV 5 still has to be built from source (EPEL is on 4.x, and this project
+needs the `geometry` module) — see [`Dockerfile`](./Dockerfile) for the exact
+`cmake` invocation. Install it to `/usr/local` with
+`-DCMAKE_INSTALL_LIBDIR=lib64`, then register it with the loader, which on
+RHEL does not search `/usr/local/lib64` by default:
+
+```sh
+echo /usr/local/lib64 | sudo tee /etc/ld.so.conf.d/opencv5.conf
+sudo ldconfig
+export PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig
+```
+
 ## Architecture
 
 1. Axum accepts an image with a 25 MiB request limit (`POST /scan`).

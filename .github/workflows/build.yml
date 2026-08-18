@@ -8,73 +8,107 @@ on:
 
 jobs:
   build:
+    # GitHub hosts no RHEL/Rocky runner, so the job runs inside the same
+    # Rocky 10 image the Dockerfiles build from — that, not the runner's
+    # OS, is what CI is actually validating against.
+    #
+    # Rocky 10 (not 9) is required: `ort`'s download-binaries feature fetches
+    # a prebuilt libonnxruntime referencing __isoc23_* (glibc >= 2.38) and
+    # libstdc++'s _M_replace_cold (GCC >= 13). Rocky 9 is glibc 2.34 / GCC 11
+    # and fails to link; Rocky 10 is glibc 2.39 / GCC 14.
     runs-on: ubuntu-latest
+    container:
+      image: rockylinux/rockylinux:10
     strategy:
+      fail-fast: false
       matrix:
-        crate: [., passport-scan-service]
+        crate: [nid-scan-service, passport-scan-service, citizenship_scanner]
     defaults:
       run:
         working-directory: ${{ matrix.crate }}
     steps:
+      # Must come BEFORE actions/checkout: the stock Rocky image has no git
+      # (checkout silently degrades to a REST tarball without it) and no tar,
+      # which actions/cache and rust-cache both shell out to. working-directory
+      # is overridden to / because matrix.crate does not exist yet.
+      #
+      # clang-devel / llvm-devel / openexr-devel live in CRB, which ships
+      # disabled on Rocky. zlib is `zlib-ng-compat-devel` on RHEL 10 —
+      # `zlib-devel` no longer exists, the zlib-ng build took over the ABI.
+      - name: Install build deps
+        working-directory: /
+        run: |
+          dnf -y install dnf-plugins-core
+          dnf config-manager --set-enabled crb
+          dnf -y install \
+            gcc gcc-c++ make cmake ninja-build git tar gzip xz which findutils \
+            pkgconf-pkg-config \
+            clang clang-devel llvm-devel \
+            libjpeg-turbo-devel libpng-devel libtiff-devel libwebp-devel openexr-devel \
+            zlib-ng-compat-devel
+
       - uses: actions/checkout@v4
 
       - name: Report OS/toolchain
         run: |
-          lsb_release -a || cat /etc/os-release
+          cat /etc/os-release
           gcc --version
           g++ --version
+          ldd --version | head -1
 
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build git pkg-config \
-            clang libclang-dev llvm-dev \
-            libjpeg-dev libpng-dev libtiff-dev libwebp-dev libopenexr-dev \
-            libavcodec-dev libavformat-dev libswscale-dev libavutil-dev \
-            zlib1g-dev
-
+      # clang-devel puts libclang in /usr/lib64 on RHEL, which is where the
+      # opencv crate's bindgen step needs to find it.
       - name: Locate libclang
         run: |
-          found="$(sudo find / -xdev \( -name 'libclang-*.so*' -o -name 'libclang.so*' \) 2>/dev/null | head -1)"
-          echo "found: $found"
-          test -n "$found"
-          libdir="$(dirname "$found")"
-          echo "LIBCLANG_PATH=$libdir" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=$libdir:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+          test -e /usr/lib64/libclang.so
+          echo "LIBCLANG_PATH=/usr/lib64" >> "$GITHUB_ENV"
 
-      # Ubuntu's own libopencv-dev is 4.6 - this project needs OpenCV 5's
-      # `geometry` module, so it's built from source here, matching the
-      # Dockerfile exactly (same version, same trimmed module set).
+      # Rocky/EPEL have no OpenCV 5 package (EPEL is still on 4.x), and this
+      # project needs OpenCV 5's `geometry` module, so it's built from source
+      # here, matching the Dockerfiles exactly (same version, same trimmed
+      # module set, same lib64 install layout).
       - name: Cache OpenCV 5 build
         id: opencv-cache
         uses: actions/cache@v4
         with:
           path: /usr/local
-          key: opencv5-${{ runner.os }}-v1
+          key: opencv5-rocky10-v1
 
+      # WITH_FFMPEG/GTK/V4L are off because RHEL ships no ffmpeg or V4L devel
+      # packages in its base repos (they need RPM Fusion) and nothing here
+      # decodes video or opens a window. CMAKE_INSTALL_LIBDIR is pinned to
+      # lib64 so the PKG_CONFIG_PATH below stays correct.
       - name: Build & install OpenCV 5
         if: steps.opencv-cache.outputs.cache-hit != 'true'
+        working-directory: /
         run: |
           git clone --branch 5.0.0 --depth 1 https://github.com/opencv/opencv.git /tmp/opencv-src
           cmake -S /tmp/opencv-src -B /tmp/opencv-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DCMAKE_INSTALL_LIBDIR=lib64 \
             -DOPENCV_GENERATE_PKGCONFIG=ON \
             -DBUILD_SHARED_LIBS=ON \
             -DBUILD_opencv_python2=OFF -DBUILD_opencv_python3=OFF \
             -DBUILD_JAVA=OFF -DBUILD_opencv_apps=OFF \
             -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_DOCS=OFF \
-            -DWITH_CUDA=OFF -DWITH_CUDNN=OFF -DWITH_OPENCL=OFF -DWITH_IPP=OFF -DWITH_ITT=OFF
+            -DWITH_CUDA=OFF -DWITH_CUDNN=OFF -DWITH_OPENCL=OFF -DWITH_IPP=OFF -DWITH_ITT=OFF \
+            -DWITH_FFMPEG=OFF -DWITH_GTK=OFF -DWITH_V4L=OFF
           cmake --build /tmp/opencv-build -j"$(nproc)"
-          sudo cmake --install /tmp/opencv-build
+          cmake --install /tmp/opencv-build
 
-      - name: ldconfig
-        run: sudo ldconfig
+      # /usr/local/lib64 is not on RHEL's default loader path (unlike Debian's
+      # /usr/local/lib), so it has to be registered explicitly — and again on
+      # a cache hit, since the cache restores files but not this conf.
+      - name: Register OpenCV with the loader
+        working-directory: /
+        run: |
+          echo /usr/local/lib64 > /etc/ld.so.conf.d/opencv5.conf
+          ldconfig
 
       - name: Set OpenCV pkg-config path
         run: |
-          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib64/pkgconfig" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
 
