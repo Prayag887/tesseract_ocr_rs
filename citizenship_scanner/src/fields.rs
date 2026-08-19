@@ -393,6 +393,22 @@ pub fn extract(lines: &[OcrLine]) -> CitizenshipDocument {
     let permanent_block_english = block_between(lines, "Permanent Address", &["नागरिकता", "Citizenship Type"]);
     let permanent_block = permanent_block_devanagari.unwrap_or(&[]);
     let permanent_block = if permanent_block.is_empty() { permanent_block_english } else { permanent_block };
+    // Last resort: the form's layout is fixed — "District"/"जिल्ला" is
+    // printed exactly twice on the page, once for birth place and once,
+    // always immediately below it, for permanent address. So when none of
+    // "Permanent Address"'s own spellings (checked above) matched
+    // anything, don't give up on the fields entirely — the *second*
+    // District cluster on the page is the permanent-address block no
+    // matter what its own header read as.
+    let permanent_block = if permanent_block.is_empty() {
+        second_occurrence_block(
+            lines,
+            &["District", "जिल्ला"],
+            &["जन्म मिति", "बाबुको", "नागरिकता", "Citizenship Type"],
+        )
+    } else {
+        permanent_block
+    };
     doc.permanent_district = value_after_keyword(permanent_block, "जिल्ला", &[])
         .or_else(|| value_after_keyword(permanent_block, "District", &[]));
     doc.permanent_municipal = local_body_in(permanent_block);
@@ -976,6 +992,35 @@ fn block_between<'a>(lines: &'a [OcrLine], start_keyword: &str, end_keywords: &[
     &lines[start..end]
 }
 
+/// Positional counterpart to `block_between`, for when a block's own header
+/// can't be matched under any spelling at all. Rather than depend on any
+/// particular label text, this finds the *second* line matching any of
+/// `keywords` and returns the block starting there — since on this
+/// certificate's fixed layout, "District"/"जिल्ला" (and every other field
+/// this is used for) prints exactly twice: once inside birth place, then
+/// again, always positioned right after it, inside permanent address.
+/// Ends at whichever `end_keywords` line comes first after that, or the end
+/// of `lines`.
+fn second_occurrence_block<'a>(lines: &'a [OcrLine], keywords: &[&str], end_keywords: &[&str]) -> &'a [OcrLine] {
+    let mut seen = 0;
+    for (start, line) in lines.iter().enumerate() {
+        if !keywords.iter().any(|kw| contains_keyword(&line.text, kw)) {
+            continue;
+        }
+        seen += 1;
+        if seen < 2 {
+            continue;
+        }
+        let end = lines[start + 1..]
+            .iter()
+            .position(|line| end_keywords.iter().any(|kw| contains_keyword(&line.text, kw)))
+            .map(|offset| start + 1 + offset)
+            .unwrap_or(lines.len());
+        return &lines[start..end];
+    }
+    &[]
+}
+
 trait NoneIfEmpty<'a> {
     fn none_if_empty(self) -> Option<&'a [OcrLine]>;
 }
@@ -1432,6 +1477,31 @@ mod tests {
         assert_eq!(doc.permanent_ward.as_deref(), Some("2"));
         assert_eq!(doc.citizenship_type.as_deref(), Some("वंशज"));
         assert_eq!(doc.date_of_issue_bs.as_deref(), Some("2077/08/07"));
+    }
+
+    #[test]
+    fn permanent_address_falls_back_to_whatever_prints_below_birth_place() {
+        // "Permanent Address" recognized as complete noise (no keyword,
+        // fuzzy or otherwise, can match it) — the label box in the image
+        // this is modeled on. District/R.M./Ward still read fine right
+        // below Birth Place, so the positional fallback in `block_after`
+        // should still recover them instead of leaving all three null.
+        let mut lines = back_page_lines();
+        let permanent_label = lines
+            .iter_mut()
+            .find(|l| l.text.starts_with("Permanent Address"))
+            .unwrap();
+        permanent_label.text = "@#$%^&*: District: Bardiya".to_owned();
+
+        let doc = extract(&lines);
+
+        assert_eq!(doc.permanent_district.as_deref(), Some("Bardiya"));
+        assert_eq!(doc.permanent_municipal.as_deref(), Some("badhaiyatal Rural Municipality"));
+        assert_eq!(doc.permanent_ward.as_deref(), Some("2"));
+        // Birth block must stay untouched by the fallback.
+        assert_eq!(doc.birth_district.as_deref(), Some("Bardiya"));
+        assert_eq!(doc.birth_municipal.as_deref(), Some("badhaiyatal Rural Municipality"));
+        assert_eq!(doc.birth_ward.as_deref(), Some("2"));
     }
 
     #[test]

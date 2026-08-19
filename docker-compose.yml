@@ -154,6 +154,7 @@ services:
       MALLOC_MMAP_THRESHOLD_: "131072"
       MALLOC_TRIM_THRESHOLD_: "131072"
       # OCR_DEBUG_LINES: "1"
+      # OCR_DEBUG_CROPS: "1"
       # OCR_DEBUG_TIMING: "1"
       # SCAN_DEBUG_TIMING: "1"
       RUST_LOG: "${RUST_LOG:-info,tower_http=debug}"

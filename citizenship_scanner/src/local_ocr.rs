@@ -302,6 +302,15 @@ impl LocalOcrEngine {
             crops.push(crop_quad(cleaned, quad)?);
         }
         let crops = classify_and_fix_rotation_batch(&self.textline_ori, crops, self.orientation_batch_size)?;
+        if std::env::var("OCR_DEBUG_CROPS").is_ok() {
+            for (i, crop) in crops.iter().enumerate() {
+                let _ = imgcodecs::imwrite(
+                    &self.output_dir.join(format!("crop_{label}_{i}.png")),
+                    crop,
+                    &Vector::new(),
+                );
+            }
+        }
         if debug {
             eprintln!("[ocr_timing] {label} crop + batched orientation: {:?}", t2.elapsed());
         }
@@ -595,12 +604,31 @@ fn crop_quad(image: &Mat, corners: &[Point2f; 4]) -> Result<Mat, AppError> {
     Ok(warped)
 }
 
+/// Classifies every detected line as upright or 180°-flipped and corrects
+/// orientation — but as a single vote across the whole page, not one
+/// decision per line. The source is one rigid printed card: every line on
+/// it shares the same real-world orientation, so if the whole card was
+/// photographed upside down, *every* crop should flip together, and if it
+/// wasn't, *none* should. Deciding per line instead risks exactly what a
+/// real scan showed: a short, sparse crop ("नागरिकता किसिम: वंशज", a few
+/// characters with a lot of background) landed a near-toss-up upright-vs-
+/// flipped score and got flipped on its own, while the declaration
+/// sentence right next to it — same physical line, same orientation —
+/// classified correctly and stayed untouched. Flipping upright text
+/// upside down doesn't just misread it, it hands the recognizer a shape it
+/// was never trained on, so the output comes back as unrecoverable noise
+/// rather than a plausible misread. Averaging the whole page's votes
+/// before acting removes that failure mode without losing the ability to
+/// fix a genuinely upside-down capture, since in that case nearly every
+/// crop agrees.
 fn classify_and_fix_rotation_batch(
     textline_ori: &Mutex<Session>,
     mut crops: Vec<Mat>,
     batch_size: usize,
 ) -> Result<Vec<Mat>, AppError> {
-    for chunk in crops.chunks_mut(batch_size) {
+    let mut total_upright = 0.0f32;
+    let mut total_flipped = 0.0f32;
+    for chunk in crops.chunks(batch_size) {
         let sample_len = (3 * TEXTLINE_ORI_HEIGHT * TEXTLINE_ORI_WIDTH) as usize;
         let mut data = Vec::with_capacity(chunk.len() * sample_len);
         for crop in chunk.iter() {
@@ -628,14 +656,17 @@ fn classify_and_fix_rotation_batch(
             data,
         )?;
 
-        for (index, crop) in chunk.iter_mut().enumerate() {
-            let upright = out[index * 2];
-            let flipped = out[index * 2 + 1];
-            if flipped > upright {
-                let mut rotated = Mat::default();
-                opencv::core::flip(crop, &mut rotated, -1)?;
-                *crop = rotated;
-            }
+        for index in 0..chunk.len() {
+            total_upright += out[index * 2];
+            total_flipped += out[index * 2 + 1];
+        }
+    }
+
+    if total_flipped > total_upright {
+        for crop in crops.iter_mut() {
+            let mut rotated = Mat::default();
+            opencv::core::flip(crop, &mut rotated, -1)?;
+            *crop = rotated;
         }
     }
     Ok(crops)
