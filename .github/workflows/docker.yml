@@ -78,3 +78,86 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  # Runtime smoke test: build the images locally (load:true), boot the same
+  # docker-compose.yml used for deployment, and verify every service answers
+  # /health through the gateway. This exercises the real deploy path end to
+  # end — it is NOT the same as `cargo build && cargo test`, which never
+  # starts a container. The image is a self-contained glibc/amd64
+  # debian:trixie bundle, so a green boot here is what both Ubuntu and RHEL
+  # hosts consume identically; the only RHEL-specific bit (SELinux relabeling)
+  # is handled by the `:z` mount flag in docker-compose.yml and can't be
+  # exercised on a GitHub-hosted runner anyway.
+  smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: nid-scan-service
+            context: ./nid-scan-service
+            image: ocr-nid-scan-service
+          - service: passport-scan-service
+            context: ./passport-scan-service
+            image: ocr-passport-scan-service
+          - service: citizenship-scan-service
+            context: ./citizenship_scanner
+            image: ocr-citizenship-scan-service
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Tagged to the same names docker-compose.yml expects, so `up -d` finds
+      # them instead of rebuilding from scratch in the runner.
+      - name: Build ${{ matrix.service }} (load)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ matrix.image }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+
+      - name: Boot stack
+        run: |
+          docker compose up -d
+          docker compose ps
+
+      # The gateway depends_on condition:service_healthy for every backend,
+      # so it won't be up until all three pass their HEALTHCHECK. Curl each
+      # proxied /health path directly to prove routing + backend liveness,
+      # with a generous retry window for first-boot model load.
+      - name: Verify all services healthy via gateway
+        env:
+          GATEWAY_HOST_PORT: "3002"
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            ok=1
+            for ep in nid passport citizenship; do
+              code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${GATEWAY_HOST_PORT}/${ep}/health" || true)"
+              if [ "$code" != "200" ]; then ok=0; fi
+            done
+            if [ "$ok" -eq 1 ]; then echo "all services healthy"; exit 0; fi
+            echo "attempt $attempt: waiting for services ($code)"
+            sleep 5
+          done
+          echo "gateway never became healthy"
+          docker compose ps
+          docker compose logs --no-color || true
+          exit 1
+
+      - name: Verify shared UI served
+        env:
+          GATEWAY_HOST_PORT: "3002"
+        run: |
+          body="$(curl -sS "http://127.0.0.1:${GATEWAY_HOST_PORT}/")"
+          grep -qi "<!DOCTYPE html" <<< "$body"
+
+      - name: Teardown
+        if: always()
+        run: docker compose down -v
