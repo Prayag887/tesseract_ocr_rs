@@ -132,10 +132,12 @@ jobs:
       # proxied /health path directly to prove routing + backend liveness,
       # with a generous retry window for first-boot model load.
       - name: Verify all services healthy via gateway
-        env:
-          GATEWAY_HOST_PORT: "3002"
         run: |
           set -euo pipefail
+          # Read the actual host port from compose instead of hardcoding it —
+          # .env can override GATEWAY_HOST_PORT (this repo's .env uses 3006).
+          GATEWAY_HOST_PORT="$(docker compose port gateway 80 | awk -F: '{print $NF}')"
+          echo "gateway on host port ${GATEWAY_HOST_PORT}"
           for attempt in $(seq 1 30); do
             ok=1
             for ep in nid passport citizenship; do
@@ -152,9 +154,8 @@ jobs:
           exit 1
 
       - name: Verify shared UI served
-        env:
-          GATEWAY_HOST_PORT: "3002"
         run: |
+          GATEWAY_HOST_PORT="$(docker compose port gateway 80 | awk -F: '{print $NF}')"
           body="$(curl -sS "http://127.0.0.1:${GATEWAY_HOST_PORT}/")"
           grep -qi "<!DOCTYPE html" <<< "$body"
 
