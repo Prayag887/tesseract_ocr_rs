@@ -1,11 +1,24 @@
-name: Docker images
+name: Docker (RHEL/Rocky) — build, smoke test & publish
 
-# Builds each service's own image from its own Dockerfile/context (see
-# docker-compose.yml's header comment on why they're independent builds).
-# PRs just build, to catch a broken Dockerfile before merge; pushes to
-# main/prod also publish to GHCR. Only linux/amd64 is built — that's what
-# both the Ubuntu and RHEL targets run, and adding arm64 would double every
-# OpenCV-from-source compile for a platform nothing here deploys to.
+# Builds the exact Rocky Linux 10 images used for deployment and then
+# actually starts the complete docker-compose stack.
+#
+# This is intentionally more than a Dockerfile syntax/build check.
+#
+# Each scanner loads OpenCV, ONNX Runtime and its ONNX models before it starts
+# serving requests. Reaching HEALTHCHECK therefore proves that:
+#
+#   - the image builds successfully on Rocky 10
+#   - OpenCV 5 links and loads correctly
+#   - libonnxruntime loads against Rocky 10's glibc/libstdc++
+#   - the ONNX models can be opened and parsed
+#   - every scanner starts successfully
+#   - nginx can route traffic to every scanner
+#
+# The GitHub runner itself is Ubuntu only because GitHub does not provide a
+# hosted RHEL runner. The deployment environment being tested is the Rocky 10
+# userspace INSIDE the built images.
+
 on:
   push:
     branches: [prod, main, dev]
@@ -13,34 +26,76 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: docker-${{ github.workflow }}-${{ github.ref }}
+  group: docker-rhel-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
+  build-and-smoke-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+
+    # A cold cache has to compile LLVM/OpenCV/Rust-heavy images from source.
+    # Warm runs are dramatically faster, but the ceiling needs to account for
+    # the genuinely expensive cold path.
+    timeout-minutes: 180
+
     permissions:
       contents: read
       packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - service: nid-scan-service
-            context: ./nid-scan-service
-            image: ocr-nid-scan-service
-          - service: passport-scan-service
-            context: ./passport-scan-service
-            image: ocr-passport-scan-service
-          - service: citizenship-scan-service
-            context: ./citizenship_scanner
-            image: ocr-citizenship-scan-service
+
     steps:
+      # GitHub-hosted runners contain many large SDKs that are irrelevant to
+      # this project. OpenCV's build tree plus three Rust target trees can
+      # otherwise exhaust the runner disk during a cold build.
+      - name: Free up disk space
+        run: |
+          set -euo pipefail
+
+          echo "--- disk before cleanup ---"
+          df -h /
+
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /usr/local/share/powershell \
+            /usr/share/swift \
+            "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
+
+          sudo docker image prune -af || true
+
+          echo
+          echo "--- disk after cleanup ---"
+          df -h /
+
       - uses: actions/checkout@v4
+
+      # GHCR requires image paths to be lowercase, while GitHub preserves the
+      # capitalization used when the repository owner was registered.
+      #
+      # One shared registry cache is used for all three Dockerfiles because
+      # their expensive Rocky/OpenCV prefix is deliberately identical.
+      - name: Compute image and cache refs
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          repo="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+
+          echo "owner=${owner}" >> "$GITHUB_OUTPUT"
+          echo "cache_ref=ghcr.io/${repo}/buildcache" >> "$GITHUB_OUTPUT"
+
+          echo "nid_ref=ghcr.io/${owner}/ocr-nid-scan-service" >> "$GITHUB_OUTPUT"
+          echo "passport_ref=ghcr.io/${owner}/ocr-passport-scan-service" >> "$GITHUB_OUTPUT"
+          echo "citizenship_ref=ghcr.io/${owner}/ocr-citizenship-scan-service" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
+      # PRs, especially fork PRs, do not necessarily have a write-capable
+      # GITHUB_TOKEN. Normal pushes can both read/write the registry cache and
+      # later publish the resulting service images.
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
@@ -49,116 +104,264 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # github.repository_owner isn't lowercased (this repo's owner has
-      # capitals), but GHCR rejects any uppercase in the image path.
-      - name: Lowercase image owner
-        id: owner
-        run: echo "name=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+      # --------------------------------------------------------------------
+      # Build images
+      # --------------------------------------------------------------------
+      #
+      # These are intentionally NOT a matrix.
+      #
+      # On a completely cold runner, all three Dockerfiles need the same
+      # expensive Rocky + OpenCV prefix. Running them in parallel would allow
+      # BuildKit to compile OpenCV three times concurrently.
+      #
+      # Building NID first populates the local BuildKit cache. Passport and
+      # citizenship then reuse that prefix immediately.
+      #
+      # A GHCR registry cache is used instead of type=gha because the complete
+      # LLVM/OpenCV/Cargo layer set can exceed the Actions cache quota.
 
-      - name: Image metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ steps.owner.outputs.name }}/${{ matrix.image }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,format=short
-
-      # The gha cache backend keys on Dockerfile content, so the OpenCV
-      # source build only re-runs when a Dockerfile actually changes —
-      # everyday pushes just replay cached layers up to the `cargo build`
-      # step. Scoped per service so one image's cache can't evict another's.
-      - name: Build ${{ matrix.service }}
+      - name: Build nid-scan-service
         uses: docker/build-push-action@v6
         with:
-          context: ${{ matrix.context }}
+          context: ./nid-scan-service
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
-
-  # Runtime smoke test: build the images locally (load:true), boot the same
-  # docker-compose.yml used for deployment, and verify every service answers
-  # /health through the gateway. This exercises the real deploy path end to
-  # end — it is NOT the same as `cargo build && cargo test`, which never
-  # starts a container. The image is a self-contained glibc/amd64
-  # debian:trixie bundle, so a green boot here is what both Ubuntu and RHEL
-  # hosts consume identically; the only RHEL-specific bit (SELinux relabeling)
-  # is handled by the `:z` mount flag in docker-compose.yml and can't be
-  # exercised on a GitHub-hosted runner anyway.
-  smoke:
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - service: nid-scan-service
-            context: ./nid-scan-service
-            image: ocr-nid-scan-service
-          - service: passport-scan-service
-            context: ./passport-scan-service
-            image: ocr-passport-scan-service
-          - service: citizenship-scan-service
-            context: ./citizenship_scanner
-            image: ocr-citizenship-scan-service
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      # Tagged to the same names docker-compose.yml expects, so `up -d` finds
-      # them instead of rebuilding from scratch in the runner.
-      - name: Build ${{ matrix.service }} (load)
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ matrix.context }}
-          platforms: linux/amd64
+          tags: ocr-nid-scan-service:latest
           load: true
           push: false
-          tags: ${{ matrix.image }}:latest
-          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-from: |
+            type=registry,ref=${{ steps.vars.outputs.cache_ref }}:rocky10
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}:rocky10,mode=max', steps.vars.outputs.cache_ref) || '' }}
 
-      - name: Boot stack
+      - name: Build passport-scan-service
+        uses: docker/build-push-action@v6
+        with:
+          context: ./passport-scan-service
+          platforms: linux/amd64
+          tags: ocr-passport-scan-service:latest
+          load: true
+          push: false
+          cache-from: |
+            type=registry,ref=${{ steps.vars.outputs.cache_ref }}:rocky10
+
+      - name: Build citizenship-scan-service
+        uses: docker/build-push-action@v6
+        with:
+          context: ./citizenship_scanner
+          platforms: linux/amd64
+          tags: ocr-citizenship-scan-service:latest
+          load: true
+          push: false
+          cache-from: |
+            type=registry,ref=${{ steps.vars.outputs.cache_ref }}:rocky10
+
+      - name: Show built images
         run: |
-          docker compose up -d
-          docker compose ps
+          docker images \
+            --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}' \
+            | grep -Ei 'REPOSITORY|ocr-'
 
-      # The gateway depends_on condition:service_healthy for every backend,
-      # so it won't be up until all three pass their HEALTHCHECK. Curl each
-      # proxied /health path directly to prove routing + backend liveness,
-      # with a generous retry window for first-boot model load.
-      - name: Verify all services healthy via gateway
+      # --------------------------------------------------------------------
+      # Runtime test
+      # --------------------------------------------------------------------
+
+      # docker-compose.yml already refers to the local tags produced above,
+      # therefore --no-build is important: the smoke test must run precisely
+      # the images BuildKit just produced rather than silently rebuilding a
+      # different image through Compose.
+      #
+      # --wait waits for all services that define HEALTHCHECK to become
+      # healthy. Scanner startup itself loads ONNX Runtime + OpenCV + models,
+      # so reaching healthy is part of the compatibility test.
+      - name: Start complete deployment stack
+        run: |
+          docker compose up \
+            -d \
+            --no-build \
+            --wait \
+            --wait-timeout 300
+
+      - name: Verify Rocky/RHEL runtime and services
         run: |
           set -euo pipefail
-          # Read the actual host port from compose instead of hardcoding it —
-          # .env can override GATEWAY_HOST_PORT (this repo's .env uses 3006).
-          GATEWAY_HOST_PORT="$(docker compose port gateway 80 | awk -F: '{print $NF}')"
-          echo "gateway on host port ${GATEWAY_HOST_PORT}"
-          for attempt in $(seq 1 30); do
-            ok=1
-            for ep in nid passport citizenship; do
-              code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${GATEWAY_HOST_PORT}/${ep}/health" || true)"
-              if [ "$code" != "200" ]; then ok=0; fi
-            done
-            if [ "$ok" -eq 1 ]; then echo "all services healthy"; exit 0; fi
-            echo "attempt $attempt: waiting for services ($code)"
-            sleep 5
-          done
-          echo "gateway never became healthy"
+
+          echo "=================================================="
+          echo "Container state"
+          echo "=================================================="
+
           docker compose ps
-          docker compose logs --no-color || true
-          exit 1
 
-      - name: Verify shared UI served
+          echo
+          echo "=================================================="
+          echo "Verify scanner is actually running Rocky Linux"
+          echo "=================================================="
+
+          # Keep the pipe inside the container shell. Piping docker exec into
+          # head on the host can make docker return 255 after head closes the
+          # pipe early, which becomes a false failure under pipefail.
+          docker compose exec -T nid-scan-service sh -c \
+            'grep -E "^(NAME|VERSION|VERSION_ID)=" /etc/os-release; ldd --version | head -1'
+
+          echo
+          echo "=================================================="
+          echo "Determine gateway port"
+          echo "=================================================="
+
+          # Never hard-code this. The committed .env may override
+          # GATEWAY_HOST_PORT.
+          gateway_port="$(
+            docker compose port gateway 80 \
+              | tail -1 \
+              | awk -F: '{print $NF}'
+          )"
+
+          test -n "$gateway_port"
+
+          base="http://127.0.0.1:${gateway_port}"
+
+          echo "Gateway: ${base}"
+
+          echo
+          echo "=================================================="
+          echo "Wait for nginx gateway"
+          echo "=================================================="
+
+          # Compose considers containers without HEALTHCHECK started as soon
+          # as their process launches. nginx can therefore still be a fraction
+          # of a second away from accepting TCP connections even though all
+          # scanner containers are already healthy.
+          for i in $(seq 1 30); do
+            if curl \
+              -fsS \
+              --max-time 5 \
+              -o /dev/null \
+              "${base}/nid/health" 2>/dev/null; then
+
+              echo "Gateway ready after ${i}s"
+              break
+            fi
+
+            if [ "$i" -eq 30 ]; then
+              echo "Gateway never accepted connections" >&2
+              exit 1
+            fi
+
+            sleep 1
+          done
+
+          echo
+          echo "=================================================="
+          echo "Health checks through nginx"
+          echo "=================================================="
+
+          for svc in nid passport citizenship; do
+            printf '%-12s ' "${svc}:"
+
+            curl \
+              -fsS \
+              --max-time 30 \
+              "${base}/${svc}/health"
+
+            echo
+          done
+
+          echo
+          echo "=================================================="
+          echo "Shared UI"
+          echo "=================================================="
+
+          curl \
+            -fsS \
+            --max-time 30 \
+            -o /tmp/index.html \
+            -w 'index.html -> HTTP %{http_code}\n' \
+            "${base}/"
+
+          grep -qi '<!DOCTYPE html' /tmp/index.html
+
+          echo
+          echo "RHEL/Rocky deployment smoke test passed."
+
+      # Without container logs, a failure caused by libonnxruntime, OpenCV,
+      # model loading or nginx routing is reduced to an unhelpful "unhealthy"
+      # result in the Actions UI.
+      - name: Dump logs on failure
+        if: failure()
         run: |
-          GATEWAY_HOST_PORT="$(docker compose port gateway 80 | awk -F: '{print $NF}')"
-          body="$(curl -sS "http://127.0.0.1:${GATEWAY_HOST_PORT}/")"
-          grep -qi "<!DOCTYPE html" <<< "$body"
+          echo "=================================================="
+          echo "Container state"
+          echo "=================================================="
 
-      - name: Teardown
+          docker compose ps -a || true
+
+          echo
+          echo "=================================================="
+          echo "Container logs"
+          echo "=================================================="
+
+          docker compose logs \
+            --no-color \
+            --tail=300 || true
+
+      # --------------------------------------------------------------------
+      # Publish
+      # --------------------------------------------------------------------
+      #
+      # Preserve the behaviour of the old docker-images workflow:
+      #
+      #   PR             -> build + test only
+      #   prod/main/dev  -> build + test + publish
+      #   manual run     -> build + test + publish
+      #
+      # Crucially, publishing happens AFTER the smoke test. A broken image is
+      # therefore never promoted merely because Docker managed to build it.
+
+      - name: Publish images to GHCR
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+
+          sha_tag="${GITHUB_SHA::7}"
+
+          publish() {
+            local local_image="$1"
+            local remote_image="$2"
+
+            echo "Publishing ${local_image}"
+
+            docker tag \
+              "${local_image}:latest" \
+              "${remote_image}:${sha_tag}"
+
+            docker push \
+              "${remote_image}:${sha_tag}"
+
+            # Keep `latest` for main, matching docker/metadata-action's
+            # previous default-branch semantics.
+            if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+              docker tag \
+                "${local_image}:latest" \
+                "${remote_image}:latest"
+
+              docker push \
+                "${remote_image}:latest"
+            fi
+          }
+
+          publish \
+            "ocr-nid-scan-service" \
+            "${{ steps.vars.outputs.nid_ref }}"
+
+          publish \
+            "ocr-passport-scan-service" \
+            "${{ steps.vars.outputs.passport_ref }}"
+
+          publish \
+            "ocr-citizenship-scan-service" \
+            "${{ steps.vars.outputs.citizenship_ref }}"
+
+      - name: Tear down
         if: always()
-        run: docker compose down -v
+        run: |
+          docker compose down \
+            -v \
+            --remove-orphans
