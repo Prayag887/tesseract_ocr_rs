@@ -34,10 +34,20 @@ jobs:
         RUSTUP_HOME: /opt/rust/rustup
         CARGO_HOME: /opt/rust/cargo
 
-    timeout-minutes: 45
+    # A cold OpenCV build can be slow on GitHub-hosted runners.
+    timeout-minutes: 90
 
     strategy:
       fail-fast: false
+
+      # All three crates use the exact same OpenCV cache key.
+      #
+      # Running the matrix in parallel on a cold cache would make all three
+      # jobs miss the cache at the same time and compile OpenCV independently.
+      # Serial execution means the first job builds/saves OpenCV and the other
+      # two restore it.
+      max-parallel: 1
+
       matrix:
         crate:
           - nid-scan-service
@@ -46,8 +56,8 @@ jobs:
 
     defaults:
       run:
-        # GitHub defaults container run steps to `sh`; explicitly use bash
-        # because this workflow relies on normal bash behaviour.
+        # GitHub container jobs otherwise default to sh. Use bash explicitly
+        # because the workflow relies on normal bash behaviour and pipefail.
         shell: bash
 
         working-directory: ${{ matrix.crate }}
@@ -115,6 +125,8 @@ jobs:
 
       - name: Report RHEL-compatible environment
         run: |
+          set -euo pipefail
+
           echo "===== OS ====="
           cat /etc/os-release
 
@@ -128,13 +140,20 @@ jobs:
 
           echo
           echo "===== glibc ====="
-          ldd --version | head -1
+
+          # Avoid `ldd --version | head -1`.
+          #
+          # With GitHub Actions' pipefail enabled, head can close the pipe
+          # before ldd finishes writing, causing ldd to receive SIGPIPE and
+          # the step to fail with exit code 141.
+          glibc_version="$(ldd --version)"
+          printf '%s\n' "$glibc_version" | sed -n '1p'
 
           echo
           echo "===== kernel ====="
           uname -a
 
-      # clang-devel installs libclang into /usr/lib64 on Rocky/RHEL.
+      # clang-devel normally installs libclang into /usr/lib64 on Rocky/RHEL.
       # Bindgen used by opencv-rust needs to locate it.
       - name: Locate libclang
         run: |
@@ -145,9 +164,14 @@ jobs:
           else
             found="$(
               find /usr/lib64 /usr/lib \
-                \( -name 'libclang.so' -o -name 'libclang.so.*' -o -name 'libclang-*.so*' \) \
+                \( \
+                  -name 'libclang.so' \
+                  -o -name 'libclang.so.*' \
+                  -o -name 'libclang-*.so' \
+                  -o -name 'libclang-*.so.*' \
+                \) \
                 2>/dev/null \
-                | head -1
+                | sed -n '1p'
             )"
 
             test -n "$found"
@@ -156,37 +180,38 @@ jobs:
           fi
 
           echo "LIBCLANG_PATH=$LIBCLANG_DIR" >> "$GITHUB_ENV"
+
           echo "Found libclang in: $LIBCLANG_DIR"
 
-      # Rocky/RHEL repositories do not currently provide the OpenCV 5 build
-      # required by this project. In particular we need the `geometry`
-      # module, so OpenCV 5.0.0 is built from source.
+      # Rocky/RHEL repositories do not provide the OpenCV 5 build required
+      # by this project. In particular, the project needs the geometry module,
+      # so OpenCV 5.0.0 is compiled from source.
       #
-      # Cache /usr/local so matrix builds and future CI runs can reuse it.
+      # /usr/local contains only the custom OpenCV installation because Rust
+      # deliberately lives under /opt/rust.
       #
       # IMPORTANT:
-      # bump v3 if any CMake option below changes.
+      # bump the cache suffix whenever any OpenCV CMake option below changes.
       - name: Cache OpenCV 5
         id: opencv-cache
         uses: actions/cache@v4
         with:
           path: /usr/local
-          key: opencv5-rocky10-v3
+          key: opencv5-rocky10-amd64-v3
 
-      # The services only process still images.
+      # The services process still images only.
       #
-      # There is therefore no need for:
-      #   videoio
-      #   FFmpeg
-      #   GTK
-      #   V4L
-      #
-      # This keeps the RHEL dependency surface considerably smaller.
+      # videoio/FFmpeg/GTK/V4L are intentionally disabled so the CI dependency
+      # surface matches the scanner use case and avoids RPM Fusion packages.
       - name: Build & install OpenCV 5
         if: steps.opencv-cache.outputs.cache-hit != 'true'
         working-directory: /
         run: |
           set -euo pipefail
+
+          rm -rf \
+            /tmp/opencv-src \
+            /tmp/opencv-build
 
           git clone \
             --branch 5.0.0 \
@@ -221,29 +246,40 @@ jobs:
             -DWITH_GTK=OFF \
             -DWITH_V4L=OFF
 
-          cmake --build /tmp/opencv-build -j"$(nproc)"
+          cmake \
+            --build /tmp/opencv-build \
+            -j"$(nproc)"
 
-          cmake --install /tmp/opencv-build
+          cmake \
+            --install /tmp/opencv-build
 
-      # /usr/local/lib64 is not guaranteed to be in RHEL's default dynamic
-      # linker search path.
+      # /usr/local/lib64 is not guaranteed to be part of RHEL's default
+      # dynamic linker path.
       #
-      # actions/cache restores the files but does not restore ldconfig's
-      # generated state, so this must run even when OpenCV came from cache.
+      # This has to run even after an actions/cache hit because the cache
+      # restores files only; it does not recreate ldconfig's runtime state.
       - name: Register OpenCV with dynamic linker
         working-directory: /
         run: |
-          echo "/usr/local/lib64" > /etc/ld.so.conf.d/opencv5.conf
+          set -euo pipefail
+
+          echo "/usr/local/lib64" \
+            > /etc/ld.so.conf.d/opencv5.conf
+
           ldconfig
 
       - name: Configure OpenCV discovery
         run: |
-          echo "PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig" >> "$GITHUB_ENV"
+          set -euo pipefail
 
-      # Install exactly the Rust version used by production.
+          echo "PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig" \
+            >> "$GITHUB_ENV"
+
+      # Install the exact Rust version used by production instead of following
+      # the moving `stable` channel.
       #
-      # Rust is deliberately installed outside /usr/local so the OpenCV cache
-      # never archives/restores the Rust toolchain or Cargo registry.
+      # Rust deliberately lives outside /usr/local so the OpenCV cache cannot
+      # accidentally archive a Rust toolchain/Cargo registry.
       - name: Install Rust 1.90.0
         working-directory: /
         run: |
@@ -260,7 +296,11 @@ jobs:
               --profile minimal \
               --default-toolchain 1.90.0
 
+          echo "===== Rust ====="
           rustc --version
+
+          echo
+          echo "===== Cargo ====="
           cargo --version
 
       - uses: Swatinem/rust-cache@v2
@@ -269,29 +309,50 @@ jobs:
 
       - name: Verify RHEL build environment
         run: |
-          echo "Rust:"
+          set -euo pipefail
+
+          echo "===== Rust ====="
           rustc --version
 
           echo
-          echo "Cargo:"
+          echo "===== Cargo ====="
           cargo --version
 
           echo
-          echo "OpenCV:"
+          echo "===== OpenCV version ====="
           pkg-config --modversion opencv5
 
           echo
-          echo "OpenCV pkg-config:"
+          echo "===== OpenCV link flags ====="
           pkg-config --libs opencv5
 
           echo
-          echo "libclang:"
+          echo "===== OpenCV include flags ====="
+          pkg-config --cflags opencv5
+
+          echo
+          echo "===== libclang ====="
           echo "$LIBCLANG_PATH"
+
+          echo
+          echo "===== OpenCV dynamic libraries ====="
+          ldconfig -p | grep 'libopencv_' || {
+            echo "OpenCV libraries were not registered with the dynamic linker"
+            exit 1
+          }
 
       - name: Build (release)
         run: |
-          cargo build --release --locked
+          set -euo pipefail
+
+          cargo build \
+            --release \
+            --locked
 
       - name: Test (release)
         run: |
-          cargo test --release --locked
+          set -euo pipefail
+
+          cargo test \
+            --release \
+            --locked
