@@ -57,6 +57,7 @@ const NET_OUTPUT_NAME: &str = "fetch_name_0";
 /// goes the wrong way, move this based on that scan, not by guessing.
 const MIN_PREPROCESS_SHORT_SIDE: i32 = 800;
 
+
 // Same PP-OCRv5_mobile_det hyperparameters the other two services use — the
 // detection model is script-agnostic.
 const DET_LIMIT_SIDE_LEN: i32 = 64;
@@ -109,6 +110,8 @@ pub struct LocalOcrEngine {
     /// — kept configurable in case a particular scan reads better without
     /// it (e.g. an already-clean, non-watermarked photocopy).
     preprocess_enabled: bool,
+    /// Off switch for the low-yield retry in `extract_blocking`.
+    fallback_enabled: bool,
     /// Where the OCR-input debug image gets written (see `extract_blocking`)
     /// — not the crop/original, which callers don't need kept around at all.
     output_dir: std::path::PathBuf,
@@ -156,7 +159,10 @@ impl LocalOcrEngine {
             .ok()
             .and_then(|value| value.parse::<bool>().ok())
             .unwrap_or(true);
-
+        let fallback_enabled = std::env::var("CITIZENSHIP_OCR_FALLBACK")
+            .ok()
+            .and_then(|value| value.parse::<bool>().ok())
+            .unwrap_or(true);
 
         Ok(Self {
             det: Mutex::new(det),
@@ -167,6 +173,7 @@ impl LocalOcrEngine {
             orientation_batch_size,
             recognition_batch_size,
             preprocess_enabled,
+            fallback_enabled,
             output_dir,
         })
     }
@@ -177,6 +184,10 @@ impl LocalOcrEngine {
     /// anything else falls back to a generic name) only controls the debug
     /// preprocessed-image filename below; extraction logic is identical
     /// either way.
+    pub fn fallback_enabled(&self) -> bool {
+        self.fallback_enabled
+    }
+
     pub async fn extract(&self, image: &[u8], side: Option<&str>) -> Result<CitizenshipDocument, AppError> {
         tokio::task::block_in_place(|| self.extract_blocking(image, side))
     }
@@ -240,11 +251,15 @@ impl LocalOcrEngine {
                 if debug {
                     eprintln!("[ocr_timing] preprocess: {:?}", t_pre.elapsed());
                 }
-                cleaned
+                Some(cleaned)
             } else {
-                bgr
+                None
             }
         };
+        // `bgr` stays alive either way: the low-yield fallback below may
+        // need the unpreprocessed crop.
+        let preprocessed = cleaned.is_some();
+        let cleaned = cleaned.as_ref().unwrap_or(&bgr);
 
         // The crop/original are deleted from disk right after this request
         // (see routes::extract) — nothing about a scanned citizenship
@@ -252,10 +267,61 @@ impl LocalOcrEngine {
         // exception, kept at fixed filenames per side, always overwritten
         // by the next scan of that side, never accumulating.
         let t1 = std::time::Instant::now();
-        let lines = self.run_detection_pipeline(&self.det, &cleaned, debug, "primary")?;
+        let (lines, flipped) =
+            self.run_detection_pipeline(&self.det, cleaned, debug, "primary", Orientation::Auto)?;
         if debug {
             eprintln!("[ocr_timing] detection pipeline total: {:?}", t1.elapsed());
         }
+        let mut document = fields::extract(&lines);
+        let mut best = (lines, cleaned);
+
+        // Low-yield fallback. Only runs when the primary pass above came
+        // back mostly empty, so every scan that already extracts properly
+        // returns exactly what it did before. Confirmed against older,
+        // yellowed certificates (and a low-resolution front page): the
+        // page-wide orientation vote in `classify_and_fix_rotation_batch`
+        // landed on "flipped" for a perfectly upright card, so every line
+        // was recognized upside down — near-zero confidence, mostly
+        // filtered out, the rest garbage — and adaptive thresholding on the
+        // aged paper broke up most rows before detection. So retry with
+        // the opposite orientation decision, then on the unpreprocessed
+        // crop both ways, keeping whichever attempt extracts the most.
+        //
+        // Choosing between attempts by populated-field count is the same
+        // heuristic `extract_blocking`'s preprocessing comment above calls
+        // unsound for picking between two *working* results; here it only
+        // ever picks between a near-empty primary and its retries, and a
+        // retry must strictly beat the primary to be used.
+        let populated = fields::populated_fields(&document);
+        if self.fallback_enabled && populated < fields::LOW_YIELD_FIELDS {
+            let opposite = if flipped { Orientation::Upright } else { Orientation::Flipped };
+            let mut attempts = vec![(cleaned, opposite, "fallback-reoriented")];
+            if preprocessed {
+                attempts.push((&bgr, Orientation::Upright, "fallback-raw-upright"));
+                attempts.push((&bgr, Orientation::Flipped, "fallback-raw-flipped"));
+            }
+            // The primary lines may have read fine and only the layout
+            // (an old-format card) defeated `fields::extract`.
+            let mut best_count = populated;
+            let reparsed = fields::extract_fallback(&best.0);
+            let reparsed_count = fields::populated_fields(&reparsed);
+            if reparsed_count > best_count {
+                best_count = reparsed_count;
+                document = reparsed;
+            }
+            for (image, orientation, label) in attempts {
+                let (lines, _) = self.run_detection_pipeline(&self.det, image, debug, label, orientation)?;
+                let candidate = fields::extract_fallback(&lines);
+                let count = fields::populated_fields(&candidate);
+                tracing::info!(label, count, primary = populated, "low-yield OCR fallback attempt");
+                if count > best_count {
+                    best_count = count;
+                    document = candidate;
+                    best = (lines, image);
+                }
+            }
+        }
+        let (lines, ocr_input) = best;
 
         // Fixed filename per side, always overwritten by the next scan of
         // that side, never accumulating: draws every surviving box (green,
@@ -264,7 +330,7 @@ impl LocalOcrEngine {
         // the right region but recognizer misread it" apart from "detector
         // never found this text at all", which reading recognized strings
         // alone can't distinguish.
-        if let Ok(annotated) = draw_debug_bboxes(&cleaned, &lines) {
+        if let Ok(annotated) = draw_debug_bboxes(ocr_input, &lines) {
             dump(&annotated, "bboxed");
         }
 
@@ -274,7 +340,6 @@ impl LocalOcrEngine {
             }
         }
 
-        let document = fields::extract(&lines);
         if debug {
             eprintln!("[ocr_timing] total: {:?}", t0.elapsed());
         }
@@ -289,7 +354,8 @@ impl LocalOcrEngine {
         cleaned: &Mat,
         debug: bool,
         label: &str,
-    ) -> Result<Vec<OcrLine>, AppError> {
+        orientation: Orientation,
+    ) -> Result<(Vec<OcrLine>, bool), AppError> {
         let t1 = std::time::Instant::now();
         let quads = detect_text_boxes(det, cleaned)?;
         if debug {
@@ -301,7 +367,8 @@ impl LocalOcrEngine {
         for quad in &quads {
             crops.push(crop_quad(cleaned, quad)?);
         }
-        let crops = classify_and_fix_rotation_batch(&self.textline_ori, crops, self.orientation_batch_size)?;
+        let (crops, flipped) =
+            classify_and_fix_rotation_batch(&self.textline_ori, crops, self.orientation_batch_size, orientation)?;
         if std::env::var("OCR_DEBUG_CROPS").is_ok() {
             for (i, crop) in crops.iter().enumerate() {
                 let _ = imgcodecs::imwrite(
@@ -334,8 +401,17 @@ impl LocalOcrEngine {
             });
         }
         fields::sort_reading_order(&mut lines);
-        Ok(lines)
+        Ok((lines, flipped))
     }
+}
+
+/// How `classify_and_fix_rotation_batch` decides whether to flip the page's
+/// line crops: by the classifier's page-wide vote, or forced either way.
+#[derive(Clone, Copy, Debug)]
+enum Orientation {
+    Auto,
+    Upright,
+    Flipped,
 }
 
 /// Draws every detected text box (green outline) plus its index and
@@ -621,11 +697,36 @@ fn crop_quad(image: &Mat, corners: &[Point2f; 4]) -> Result<Mat, AppError> {
 /// before acting removes that failure mode without losing the ability to
 /// fix a genuinely upside-down capture, since in that case nearly every
 /// crop agrees.
+///
+/// `orientation` overrides the vote when it isn't `Orientation::Auto` — the
+/// low-yield fallback in `extract_blocking` uses that to retry with the
+/// opposite decision. Returns whether the crops ended up flipped.
 fn classify_and_fix_rotation_batch(
     textline_ori: &Mutex<Session>,
     mut crops: Vec<Mat>,
     batch_size: usize,
-) -> Result<Vec<Mat>, AppError> {
+    orientation: Orientation,
+) -> Result<(Vec<Mat>, bool), AppError> {
+    let flip = match orientation {
+        Orientation::Auto => page_votes_flipped(textline_ori, &crops, batch_size)?,
+        Orientation::Upright => false,
+        Orientation::Flipped => true,
+    };
+    if flip {
+        for crop in crops.iter_mut() {
+            let mut rotated = Mat::default();
+            opencv::core::flip(crop, &mut rotated, -1)?;
+            *crop = rotated;
+        }
+    }
+    Ok((crops, flip))
+}
+
+fn page_votes_flipped(
+    textline_ori: &Mutex<Session>,
+    crops: &[Mat],
+    batch_size: usize,
+) -> Result<bool, AppError> {
     let mut total_upright = 0.0f32;
     let mut total_flipped = 0.0f32;
     for chunk in crops.chunks(batch_size) {
@@ -662,14 +763,7 @@ fn classify_and_fix_rotation_batch(
         }
     }
 
-    if total_flipped > total_upright {
-        for crop in crops.iter_mut() {
-            let mut rotated = Mat::default();
-            opencv::core::flip(crop, &mut rotated, -1)?;
-            *crop = rotated;
-        }
-    }
-    Ok(crops)
+    Ok(total_flipped > total_upright)
 }
 
 fn recognize_lines_parallel(

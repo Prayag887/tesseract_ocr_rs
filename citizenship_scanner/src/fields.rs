@@ -20,6 +20,9 @@
 
 use serde::{Deserialize, Serialize};
 
+mod legacy;
+pub use legacy::extract_fallback;
+
 #[derive(Debug, PartialEq, Clone)]
 pub struct OcrLine {
     pub text: String,
@@ -522,6 +525,38 @@ fn clean_text(value: Option<String>) -> Option<String> {
         // character long.
         trimmed.chars().count() >= 2 && trimmed.chars().any(char::is_alphabetic)
     })
+}
+
+/// An extraction with fewer populated fields than this counts as failed and
+/// triggers the OCR engine's low-yield fallbacks (`local_ocr::extract_blocking`,
+/// `routes::extract`). Every side of every working real scan fills 9+; a
+/// failed one fills 0-1.
+pub const LOW_YIELD_FIELDS: usize = 4;
+
+/// How many of `doc`'s fields hold a value — the yield signal the OCR
+/// engine uses to decide whether a scan needs its low-yield fallback.
+pub fn populated_fields(doc: &CitizenshipDocument) -> usize {
+    [
+        &doc.citizenship_number,
+        &doc.full_name,
+        &doc.gender,
+        &doc.date_of_birth_ad,
+        &doc.date_of_birth_bs,
+        &doc.birth_district,
+        &doc.birth_municipal,
+        &doc.birth_ward,
+        &doc.permanent_district,
+        &doc.permanent_municipal,
+        &doc.permanent_ward,
+        &doc.father_name,
+        &doc.mother_name,
+        &doc.spouse_name,
+        &doc.citizenship_type,
+        &doc.date_of_issue_bs,
+    ]
+    .iter()
+    .filter(|field| field.is_some())
+    .count()
 }
 
 /// Merges a front-side and back-side [`extract`] result into one document.

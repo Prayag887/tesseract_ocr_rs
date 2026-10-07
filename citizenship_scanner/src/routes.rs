@@ -166,16 +166,33 @@ pub async fn extract(
     Path(id): Path<Uuid>,
     Query(query): Query<ExtractQuery>,
 ) -> Result<Json<CitizenshipDocument>, AppError> {
-    let image = {
+    let (image, original) = {
         let scans = state.scans.lock().await;
-        scans.get(&id).ok_or(AppError::NotFound)?.crop.clone()
+        let entry = scans.get(&id).ok_or(AppError::NotFound)?;
+        (entry.crop.clone(), entry.original.clone())
     };
     let _permit = state
         .processing_permits
         .acquire()
         .await
         .expect("processing semaphore is never closed");
-    let document = state.ocr.extract(&image, query.side.as_deref()).await?;
+    let mut document = state.ocr.extract(&image, query.side.as_deref()).await?;
+
+    // Last-resort fallback for a crop that still reads as near-empty: the
+    // corner detector can lock onto a strong rectangle *inside* the card
+    // instead of its edges (confirmed on an old-format back page, where it
+    // cropped to the fingerprint box), leaving the OCR only a corner of the
+    // text. Re-reading the untouched upload recovers that case; it's kept
+    // only if it strictly beats the crop, so a good crop is never replaced.
+    let populated = fields::populated_fields(&document);
+    if state.ocr.fallback_enabled() && populated < fields::LOW_YIELD_FIELDS && original != image {
+        let from_original = state.ocr.extract(&original, query.side.as_deref()).await?;
+        let count = fields::populated_fields(&from_original);
+        tracing::info!(count, crop = populated, "low-yield OCR fallback on original upload");
+        if count > populated {
+            document = from_original;
+        }
+    }
 
     // Nothing about a scanned citizenship certificate needs to persist past
     // its own extraction.
