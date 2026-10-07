@@ -267,8 +267,8 @@ impl LocalOcrEngine {
         // exception, kept at fixed filenames per side, always overwritten
         // by the next scan of that side, never accumulating.
         let t1 = std::time::Instant::now();
-        let (lines, flipped) =
-            self.run_detection_pipeline(&self.det, cleaned, debug, "primary", Orientation::Auto)?;
+        let quads = self.detect(cleaned, debug, "primary")?;
+        let (lines, flipped) = self.read_quads(cleaned, &quads, debug, "primary", Orientation::Auto)?;
         if debug {
             eprintln!("[ocr_timing] detection pipeline total: {:?}", t1.elapsed());
         }
@@ -287,6 +287,11 @@ impl LocalOcrEngine {
         // the opposite orientation decision, then on the unpreprocessed
         // crop both ways, keeping whichever attempt extracts the most.
         //
+        // Detection is the expensive stage (seconds; orientation and
+        // recognition together are ~0.1s) and doesn't depend on orientation,
+        // so it runs at most once per image: the reoriented retry reuses the
+        // primary boxes, and both raw-crop retries share one detection.
+        //
         // Choosing between attempts by populated-field count is the same
         // heuristic `extract_blocking`'s preprocessing comment above calls
         // unsound for picking between two *working* results; here it only
@@ -294,12 +299,6 @@ impl LocalOcrEngine {
         // retry must strictly beat the primary to be used.
         let populated = fields::populated_fields(&document);
         if self.fallback_enabled && populated < fields::LOW_YIELD_FIELDS {
-            let opposite = if flipped { Orientation::Upright } else { Orientation::Flipped };
-            let mut attempts = vec![(cleaned, opposite, "fallback-reoriented")];
-            if preprocessed {
-                attempts.push((&bgr, Orientation::Upright, "fallback-raw-upright"));
-                attempts.push((&bgr, Orientation::Flipped, "fallback-raw-flipped"));
-            }
             // The primary lines may have read fine and only the layout
             // (an old-format card) defeated `fields::extract`.
             let mut best_count = populated;
@@ -309,8 +308,16 @@ impl LocalOcrEngine {
                 best_count = reparsed_count;
                 document = reparsed;
             }
-            for (image, orientation, label) in attempts {
-                let (lines, _) = self.run_detection_pipeline(&self.det, image, debug, label, orientation)?;
+
+            let opposite = if flipped { Orientation::Upright } else { Orientation::Flipped };
+            let raw_quads = if preprocessed { Some(self.detect(&bgr, debug, "fallback-raw")?) } else { None };
+            let mut attempts = vec![(cleaned, &quads, opposite, "fallback-reoriented")];
+            if let Some(raw_quads) = &raw_quads {
+                attempts.push((&bgr, raw_quads, Orientation::Upright, "fallback-raw-upright"));
+                attempts.push((&bgr, raw_quads, Orientation::Flipped, "fallback-raw-flipped"));
+            }
+            for (image, quads, orientation, label) in attempts {
+                let (lines, _) = self.read_quads(image, quads, debug, label, orientation)?;
                 let candidate = fields::extract_fallback(&lines);
                 let count = fields::populated_fields(&candidate);
                 tracing::info!(label, count, primary = populated, "low-yield OCR fallback attempt");
@@ -319,6 +326,18 @@ impl LocalOcrEngine {
                     document = candidate;
                     best = (lines, image);
                 }
+            }
+
+            // Always from the raw crop, whichever attempt won: binarization
+            // reshapes these numerals enough to flip digits (१ -> ९, ८ -> ५ on
+            // a real old card), and every attempt's boxes share the raw
+            // crop's coordinates. A majority vote also beats the single read
+            // `extract_fallback` may have accepted, since it includes it.
+            // An inconclusive vote over a found number line also discards
+            // the single read: the reads themselves showed it's unreliable,
+            // and a wrong number is worse than none.
+            if let Some(number) = self.reread_citizenship_number(&bgr, &best.0)? {
+                document.citizenship_number = number;
             }
         }
         let (lines, ocr_input) = best;
@@ -336,7 +355,7 @@ impl LocalOcrEngine {
 
         if std::env::var("OCR_DEBUG_LINES").is_ok() {
             for (i, line) in lines.iter().enumerate() {
-                tracing::info!("line {i}: {:?} conf={:.3}", line.text, line.confidence);
+                tracing::info!("line {i}: {:?} conf={:.3} poly={:?}", line.text, line.confidence, line.polygon);
             }
         }
 
@@ -346,26 +365,29 @@ impl LocalOcrEngine {
         Ok(document)
     }
 
-    /// The full detect -> crop -> orient -> recognize pass, filtered to the
-    /// lines that clear `min_confidence`.
-    fn run_detection_pipeline(
+    fn detect(&self, image: &Mat, debug: bool, label: &str) -> Result<Vec<[Point2f; 4]>, AppError> {
+        let t1 = std::time::Instant::now();
+        let quads = detect_text_boxes(&self.det, image)?;
+        if debug {
+            eprintln!("[ocr_timing] {label} detect_text_boxes: {:?} ({} boxes)", t1.elapsed(), quads.len());
+        }
+        Ok(quads)
+    }
+
+    /// Crop -> orient -> recognize over already-detected boxes, filtered to
+    /// the lines that clear `min_confidence`.
+    fn read_quads(
         &self,
-        det: &Mutex<Session>,
-        cleaned: &Mat,
+        image: &Mat,
+        quads: &[[Point2f; 4]],
         debug: bool,
         label: &str,
         orientation: Orientation,
     ) -> Result<(Vec<OcrLine>, bool), AppError> {
-        let t1 = std::time::Instant::now();
-        let quads = detect_text_boxes(det, cleaned)?;
-        if debug {
-            eprintln!("[ocr_timing] {label} detect_text_boxes: {:?} ({} boxes)", t1.elapsed(), quads.len());
-        }
-
         let t2 = std::time::Instant::now();
         let mut crops = Vec::with_capacity(quads.len());
-        for quad in &quads {
-            crops.push(crop_quad(cleaned, quad)?);
+        for quad in quads {
+            crops.push(crop_quad(image, quad)?);
         }
         let (crops, flipped) =
             classify_and_fix_rotation_batch(&self.textline_ori, crops, self.orientation_batch_size, orientation)?;
@@ -389,7 +411,7 @@ impl LocalOcrEngine {
         }
 
         let mut lines = Vec::with_capacity(quads.len());
-        for (quad, (text, confidence)) in quads.into_iter().zip(recognized) {
+        for (quad, (text, confidence)) in quads.iter().zip(recognized) {
             let text = text.trim();
             if text.is_empty() || confidence < self.min_confidence {
                 continue;
@@ -402,6 +424,76 @@ impl LocalOcrEngine {
         }
         fields::sort_reading_order(&mut lines);
         Ok((lines, flipped))
+    }
+}
+
+impl LocalOcrEngine {
+    /// Re-reads the likeliest citizenship-number line (see
+    /// `fields::number_line`) from several tighter crops of `image` and
+    /// returns the majority reading (see `fields::vote_number`). Only called
+    /// from the low-yield fallback. The detector's box carries unclip
+    /// padding that, on old cards' smudged italic numerals, regularly
+    /// misreads a digit or the separator; a crop starting nearer the digits
+    /// and trimmed vertically reads cleanly far more often, but which exact
+    /// trim works varies line to line — hence voting rather than picking one.
+    ///
+    /// `Ok(None)`: no number line to re-read. `Ok(Some(None))`: re-read, but
+    /// the reads didn't agree.
+    fn reread_citizenship_number(&self, image: &Mat, lines: &[OcrLine]) -> Result<Option<Option<String>>, AppError> {
+        let Some(index) = fields::number_line(lines) else { return Ok(None) };
+        let line = &lines[index];
+        let size = image.size()?;
+        let left = line.polygon.iter().map(|p| p[0]).min().unwrap_or(0).clamp(0, size.width - 1);
+        let right = line.polygon.iter().map(|p| p[0]).max().unwrap_or(0).clamp(left + 1, size.width);
+        let top = line.polygon.iter().map(|p| p[1]).min().unwrap_or(0).clamp(0, size.height - 1);
+        let bottom = line.polygon.iter().map(|p| p[1]).max().unwrap_or(0).clamp(top + 1, size.height);
+        let (width, height) = (right - left, bottom - top);
+
+        // Where the digits start, estimated from the character position of
+        // the first digit — scaled down because label glyphs are narrower
+        // than digits, so a raw fraction overshoots into the number.
+        let chars: Vec<char> = line.text.chars().collect();
+        let first_digit = chars
+            .iter()
+            .position(|c| c.is_ascii_digit() || ('०'..='९').contains(c))
+            .unwrap_or(0);
+        let digit_fraction = first_digit as f32 / chars.len().max(1) as f32;
+
+        // Horizontal jitter (start/end offsets, in units of line height so
+        // it scales with the print) matters as much as the vertical trims:
+        // when the number opens the line, the two digit-start estimates
+        // coincide and only jitter makes the reads independent. The box's
+        // unclip padding leaves ~0.4 line heights past the last digit, so
+        // trimming 0.15 off the right end never cuts into it.
+        let mut windows: Vec<(i32, i32)> = Vec::new();
+        for start_scale in [0.5_f32, 0.7] {
+            let x0 = left + (width as f32 * digit_fraction * start_scale) as i32;
+            for (start_shift, end_trim) in [(0.0_f32, 0.0_f32), (0.25, 0.0), (0.0, 0.15)] {
+                let window = (x0 + (height as f32 * start_shift) as i32, right - (height as f32 * end_trim) as i32);
+                if window.1 - window.0 >= 8 && !windows.contains(&window) {
+                    windows.push(window);
+                }
+            }
+        }
+        let mut crops = Vec::new();
+        for &(x0, x1) in &windows {
+            for trim in [0.0_f32, 0.05, 0.1, 0.15, 0.2] {
+                let y0 = top + (height as f32 * trim) as i32;
+                let y1 = bottom - (height as f32 * trim) as i32;
+                if y1 - y0 < 8 {
+                    continue;
+                }
+                crops.push(image.roi(Rect::new(x0, y0, x1 - x0, y1 - y0))?.try_clone()?);
+            }
+        }
+        let mut reads = recognize_lines_batch(&self.rec[0], &self.rec_vocab, &crops, 1)?;
+        reads.push((line.text.clone(), line.confidence));
+        if std::env::var("OCR_DEBUG_LINES").is_ok() {
+            tracing::info!(?reads, "citizenship number re-read candidates");
+        }
+        let number = fields::vote_number(&reads);
+        tracing::info!(?number, reads = reads.len(), "citizenship number re-read");
+        Ok(Some(number))
     }
 }
 

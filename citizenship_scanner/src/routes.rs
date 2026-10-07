@@ -23,6 +23,10 @@ use crate::scanner;
 struct ScanEntry {
     original: Vec<u8>,
     crop: Vec<u8>,
+    /// The corner detector found nothing and the crop is just the whole
+    /// upload — re-reading the original in `extract`'s fallback would only
+    /// repeat the same OCR, so it's skipped.
+    crop_is_full_frame: bool,
 }
 
 pub struct AppState {
@@ -114,7 +118,8 @@ pub async fn scan(
         orig_width: output.orig_width,
         orig_height: output.orig_height,
     };
-    state.scans.lock().await.insert(id, ScanEntry { original, crop: output.jpeg_bytes });
+    let crop_is_full_frame = !output.corners_detected;
+    state.scans.lock().await.insert(id, ScanEntry { original, crop: output.jpeg_bytes, crop_is_full_frame });
 
     Ok(Json(response))
 }
@@ -148,6 +153,7 @@ pub async fn crop(
     // just to guard it.
     if let Some(entry) = state.scans.lock().await.get_mut(&id) {
         entry.crop = output.jpeg_bytes;
+        entry.crop_is_full_frame = false;
     }
 
     Ok(Json(response))
@@ -166,10 +172,10 @@ pub async fn extract(
     Path(id): Path<Uuid>,
     Query(query): Query<ExtractQuery>,
 ) -> Result<Json<CitizenshipDocument>, AppError> {
-    let (image, original) = {
+    let (image, original, crop_is_full_frame) = {
         let scans = state.scans.lock().await;
         let entry = scans.get(&id).ok_or(AppError::NotFound)?;
-        (entry.crop.clone(), entry.original.clone())
+        (entry.crop.clone(), entry.original.clone(), entry.crop_is_full_frame)
     };
     let _permit = state
         .processing_permits
@@ -185,7 +191,7 @@ pub async fn extract(
     // text. Re-reading the untouched upload recovers that case; it's kept
     // only if it strictly beats the crop, so a good crop is never replaced.
     let populated = fields::populated_fields(&document);
-    if state.ocr.fallback_enabled() && populated < fields::LOW_YIELD_FIELDS && original != image {
+    if state.ocr.fallback_enabled() && populated < fields::LOW_YIELD_FIELDS && !crop_is_full_frame {
         let from_original = state.ocr.extract(&original, query.side.as_deref()).await?;
         let count = fields::populated_fields(&from_original);
         tracing::info!(count, crop = populated, "low-yield OCR fallback on original upload");

@@ -263,6 +263,89 @@ fn clean_number(text: &str) -> Option<String> {
     (clean && digits >= 6).then(|| converted.split_whitespace().collect::<Vec<_>>().join(""))
 }
 
+/// The line most likely to hold the holder's citizenship number, for the
+/// OCR engine to re-read at higher fidelity when no clean number came out of
+/// the normal pass: the first line, in reading order, carrying 8+ digits
+/// that isn't a date. Labels are deliberately not required — the old
+/// back's "ना.प्र.प.नं" read as "नपत"/"ना्पन"/"ना.प्र प न" across real
+/// scans, and the old front prints the number with no label at all.
+pub fn number_line(lines: &[OcrLine]) -> Option<usize> {
+    lines.iter().position(|line| {
+        let text = devanagari_digits_to_ascii(&line.text);
+        let digit_runs: Vec<&str> =
+            text.split(|c: char| !c.is_ascii_digit()).filter(|run| !run.is_empty()).collect();
+        let digits: usize = digit_runs.iter().map(|run| run.len()).sum();
+        let is_date = ["मिति", "साल", "ऐन", "जारी"].iter().any(|kw| line.text.contains(kw))
+            || matches!(digit_runs.as_slice(), [y, m, d] if y.len() == 4 && m.len() <= 2 && d.len() <= 2);
+        digits >= 8 && !is_date
+    })
+}
+
+/// Majority vote over several independent reads of the same number line
+/// (`(text, confidence)`, from differently-cropped copies — see
+/// `local_ocr::reread_citizenship_number`). One read of this italic,
+/// smudged print is unreliable: across real crops the "/" came back as
+/// "४", "८", "^", "×", "\\" or nothing, and single digits flipped
+/// (१ -> ९). But the misreads scatter while the correct digits repeat, so
+/// the digit sequence most reads agree on wins (it needs 3+ votes and a
+/// strict lead), and its formatting comes from the agreeing reads — any
+/// single symbol between two digit runs is the printed separator.
+pub fn vote_number(reads: &[(String, f32)]) -> Option<String> {
+    let mut tally: Vec<(String, usize, f32, Vec<String>)> = Vec::new();
+    for (text, confidence) in reads {
+        let Some(formatted) = format_number_read(text) else { continue };
+        let key: String = formatted.chars().filter(char::is_ascii_digit).collect();
+        match tally.iter_mut().find(|(existing, ..)| *existing == key) {
+            Some((_, count, total, forms)) => {
+                *count += 1;
+                *total += confidence;
+                forms.push(formatted);
+            }
+            None => tally.push((key, 1, *confidence, vec![formatted])),
+        }
+    }
+    tally.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.total_cmp(&a.2)));
+    let (key, count, _, forms) = tally.first()?;
+    let runner_up = tally.get(1).map_or(0, |entry| entry.1);
+    if *count < 3 || *count <= runner_up {
+        return None;
+    }
+    let mut separated: Vec<&String> = forms.iter().filter(|form| form.len() > key.len()).collect();
+    separated.sort();
+    let best_form = separated
+        .chunk_by(|a, b| a == b)
+        .max_by_key(|group| group.len())
+        .map(|group| group[0].clone());
+    Some(best_form.unwrap_or_else(|| key.clone()))
+}
+
+/// The digits of one read from its first digit to its last, with each run
+/// of non-digits between them collapsed to one separator ("-" if that run
+/// has one, else "/"; whitespace alone is dropped). `None` below 8 digits.
+fn format_number_read(text: &str) -> Option<String> {
+    let converted = devanagari_digits_to_ascii(text);
+    let start = converted.find(|c: char| c.is_ascii_digit())?;
+    let end = converted.rfind(|c: char| c.is_ascii_digit())? + 1;
+    let mut out = String::new();
+    let mut gap = String::new();
+    for c in converted[start..end].chars() {
+        if c.is_ascii_digit() {
+            if !gap.is_empty() {
+                if gap.contains('-') {
+                    out.push('-');
+                } else if !gap.trim().is_empty() {
+                    out.push('/');
+                }
+                gap.clear();
+            }
+            out.push(c);
+        } else {
+            gap.push(c);
+        }
+    }
+    (out.chars().filter(char::is_ascii_digit).count() >= 8).then_some(out)
+}
+
 /// Strips label punctuation that leaked into a value ("- काठमाण्डौ") and
 /// drops values that are themselves just a label.
 fn tidy(mut doc: CitizenshipDocument) -> CitizenshipDocument {
@@ -386,6 +469,42 @@ mod tests {
         let doc = extract_fallback(&lines);
         assert_eq!(doc.father_name, None);
         assert_ne!(doc.full_name.as_deref(), Some("फुलमाया अधिकारी"));
+    }
+
+    #[test]
+    fn number_vote_recovers_the_printed_number_from_noisy_reads() {
+        // Actual reads of the old back's number from real crop variants.
+        let reads: Vec<(String, f32)> = [
+            "ना.प्र प न: २७१०६०९९८६",
+            "न २७१०६०×९९८६",
+            "न:- २७१०६०\\९९८६",
+            "न:- २७१०६०^९९८६",
+            "न:- २७१०६०/९९८६",
+            "२७१०६०४९९८६",
+            "२७१०८०९९5६",
+            "-२७१०६०/९९५६",
+        ]
+        .iter()
+        .map(|text| (text.to_string(), 0.8))
+        .collect();
+        assert_eq!(vote_number(&reads).as_deref(), Some("271060/9986"));
+    }
+
+    #[test]
+    fn number_vote_needs_a_clear_majority() {
+        let reads: Vec<(String, f32)> =
+            ["२७१०६०/९९८६", "२७९०६०/९९८६", "२७१०६०/९९५६"].iter().map(|t| (t.to_string(), 0.8)).collect();
+        assert_eq!(vote_number(&reads), None);
+    }
+
+    #[test]
+    fn number_line_skips_dates_and_finds_unlabeled_numbers() {
+        let lines = vec![
+            line("नेपाल नागरिकता ऐन २०६३ बमोजिम", 0, 0, 900),
+            line("मितिः २०६४/०५/२६", 0, 100, 400),
+            line("R७9०६0/९९५६", 0, 200, 400),
+        ];
+        assert_eq!(number_line(&lines), Some(2));
     }
 
     #[test]

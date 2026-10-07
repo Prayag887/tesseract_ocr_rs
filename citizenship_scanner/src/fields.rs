@@ -21,7 +21,7 @@
 use serde::{Deserialize, Serialize};
 
 mod legacy;
-pub use legacy::extract_fallback;
+pub use legacy::{extract_fallback, number_line, vote_number};
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct OcrLine {
