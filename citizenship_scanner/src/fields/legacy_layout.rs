@@ -1,51 +1,28 @@
-//! Fallback-only extraction for the older citizenship certificate layout
-//! (the yellowed, pre-2073 cards still in circulation). Never part of the
-//! primary path: [`super::extract`] runs unchanged first, and this only
-//! fills the fields it left empty, so it is used solely when the OCR engine
-//! has already judged a scan low-yield (see `local_ocr::extract_blocking`).
+//! Old (yellow, pre-2073) card layout. Fallback only: runs [`extract`] first and fills its gaps;
+//! called just for scans `extraction` already judged low-yield.
 //!
-//! What differs on the old layout, all confirmed on a real old-format scan:
-//!
-//! - Front: the certificate number prints with no label at all, just
-//!   "२७१०६०/९९८६" above the name row; the back labels it "ना.प्र.प.नं".
-//! - Name labels are "नाम,थर" (comma, not space), and a value often sits in
-//!   a separate box whose top edge lies above the label's, so reading order
-//!   puts it *before* the label and `nearest_value_near` never sees it.
-//! - Each address block has one combined local-body label,
-//!   "उ.म.न.पा/गा.वि.स", so the body type can't be read off the label;
-//!   [`super::local_body_in`] then matches its first alternative and
-//!   returns the rest of the label as the "value".
-//! - The block headers ("जन्मस्थान-", "स्थायी बासस्थान-") get their own
-//!   boxes, which sort after the first district box of the same row, so
-//!   block scoping misses the district rows entirely.
-//! - Back: the holder's name is "प्रमाणपत्र बाहकको नाम", the issue date is a
-//!   bare "मिति".
+//! Old-layout differences: front number has no label (back: "ना.प्र.प.नं"); names are "नाम,थर";
+//! values and block headers sit in their own boxes and often sort before their labels; one
+//! combined "उ.म.न.पा/गा.वि.स" local-body label; back uses "बाहकको नाम" and a bare "मिति".
 
-use super::{
-    Bounds, CitizenshipDocument, OcrLine, contains_keyword, devanagari_digits_to_ascii, find_keyword,
-    looks_like_noise, normalize_gender, parse_bs_date, sanitize,
-};
+use super::current_layout::extract;
+use super::document::{CitizenshipDocument, sanitize};
+use super::keywords::{contains_keyword, find_keyword, looks_like_noise};
+use super::layout::{Bounds, OcrLine};
+use super::values::{devanagari_digits_to_ascii, normalize_gender, parse_bs_date, ward_number};
 
-/// Labels that can never be a field's value — a value equal to one of these
-/// means the search ran onto the next row's label (seen on the old back
-/// page: an empty spouse row returned "ठेगाना").
+/// A value equal to one of these means the search ran into the next row's label.
 const LABEL_ONLY_VALUES: &[&str] = &["ठेगाना", "नागरिकता", "नाम थर", "नाम,थर", "जिल्ला", "वडा नं"];
 
-/// [`super::extract`], plus the old-layout rules above for whatever it left
-/// empty, plus a punctuation tidy-up. Only ever called on a scan the
-/// primary pass already failed on.
+/// [`extract`] + old-layout rules for the fields it left empty + punctuation tidy-up.
 pub fn extract_fallback(lines: &[OcrLine]) -> CitizenshipDocument {
-    let mut doc = super::extract(lines);
+    let mut doc = extract(lines);
 
-    // The rules below that assign by position (n-th name row, n-th
-    // local-body row) are only sound on the old front's fixed layout —
-    // tried on a newer-layout front that had also failed the primary pass,
-    // the n-th "नाम थर" row put the mother's name into `father_name`. The
-    // combined "उ.म.न.पा/गा.वि.स" label is what identifies that layout.
+    // Position-based rules (n-th name/address row) are only safe on the old front, identified by
+    // its combined local-body label; on a newer card they mis-assigned the mother as father.
     let old_front = lines.iter().any(|line| is_combined_local_body_label(&line.text));
 
-    // The combined label means the generic local-body result is the
-    // label's own tail, not a place — always replace it when present.
+    // With the combined label, the generic local-body value is just the label's tail — replace it.
     let municipal = nth_values(lines, |text| is_combined_local_body_label(text), combined_local_body_value);
     if let Some(value) = municipal.first() {
         doc.birth_municipal = value.clone();
@@ -58,8 +35,7 @@ pub fn extract_fallback(lines: &[OcrLine]) -> CitizenshipDocument {
         fill_old_front_addresses(&mut doc, lines);
     }
 
-    // Holder, father, mother — the old front prints exactly these three
-    // "नाम थर" rows, in that order, top to bottom.
+    // Old front prints exactly three name rows: holder, father, mother.
     if old_front {
         let mut name_labels: Vec<usize> =
             (0..lines.len()).filter(|&index| is_name_label(&lines[index].text)).collect();
@@ -87,9 +63,7 @@ pub fn extract_fallback(lines: &[OcrLine]) -> CitizenshipDocument {
     tidy(doc)
 }
 
-/// Birth place prints above permanent address, each with one district and
-/// one ward row — so the first match of each is birth, the second
-/// permanent.
+/// First district/ward row is birth place, second is permanent address.
 fn fill_old_front_addresses(doc: &mut CitizenshipDocument, lines: &[OcrLine]) {
     let districts = nth_values(
         lines,
@@ -100,7 +74,7 @@ fn fill_old_front_addresses(doc: &mut CitizenshipDocument, lines: &[OcrLine]) {
     fill(&mut doc.permanent_district, districts.get(1).cloned().flatten());
 
     let wards = nth_values(lines, |text| text.contains("वडा"), |text| {
-        value_after(text, "वडा").and_then(|value| super::ward_number(&value))
+        value_after(text, "वडा").and_then(|value| ward_number(&value))
     });
     fill(&mut doc.birth_ward, wards.first().cloned().flatten());
     fill(&mut doc.permanent_ward, wards.get(1).cloned().flatten());
@@ -112,10 +86,7 @@ fn fill(field: &mut Option<String>, value: Option<String>) {
     }
 }
 
-/// For every line matching `is_label`, top to bottom, the value `value_of`
-/// reads from its own text — the old layout's "first match is birth place,
-/// second is permanent address" rows, ordered by position rather than by
-/// the block headers that misorder on this layout.
+/// `value_of` for each `is_label` line, top to bottom.
 fn nth_values(
     lines: &[OcrLine],
     is_label: impl Fn(&str) -> bool,
@@ -126,8 +97,7 @@ fn nth_values(
     matches.into_iter().map(|line| value_of(&line.text)).collect()
 }
 
-/// Text after `keyword`'s colon (or after the keyword when there is none),
-/// with label punctuation stripped.
+/// Text after `keyword`'s colon (or after the keyword), label punctuation stripped.
 fn value_after(text: &str, keyword: &str) -> Option<String> {
     let start = text.find(keyword)? + keyword.len();
     after_colon(&text[start..])
@@ -151,21 +121,17 @@ fn trim_label_punctuation(text: &str) -> &str {
     text.trim_matches(|c: char| c.is_whitespace() || matches!(c, '-' | ':' | 'ः' | '.' | ',' | '/' | '*'))
 }
 
-/// "उ.म.न.पा/गा.वि.स" — two local-body types joined by a slash. Matched on
-/// the slash plus the VDC abbreviation (dots are often dropped by OCR).
+/// "उ.म.न.पा/गा.वि.स": the slash plus the VDC abbreviation (OCR often drops the dots).
 fn is_combined_local_body_label(text: &str) -> bool {
     text.contains('/') && (contains_keyword(text, "गा.वि.स") || contains_keyword(text, "गाविस"))
 }
 
-/// The place after the combined label, as printed — the type can't be
-/// inferred from a label that lists several, so none is appended.
+/// Place after the combined label, as printed; type unknown, so none appended.
 fn combined_local_body_value(text: &str) -> Option<String> {
     let label_end = ["गा.वि.स", "गाविस"]
         .iter()
         .find_map(|keyword| find_keyword(text, keyword, 1).map(|(_, end)| end))?;
     let mut rest = &text[label_end..];
-    // The label's last letter often reads with a trailing "ः"/"." that
-    // isn't part of the value.
     if let Some(stop) = rest.find("वडा") {
         rest = &rest[..stop];
     }
@@ -173,17 +139,13 @@ fn combined_local_body_value(text: &str) -> Option<String> {
     (value.chars().count() >= 2).then(|| value.to_owned())
 }
 
-/// "नाम थर" / "नाम,थर" (with or without a relative's prefix in the same
-/// box). Excludes the back page's issuing officer row, which shares the
-/// label but has its own ("दर्जा"/"दस्तखत") neighbours.
+/// "नाम थर" / "नाम,थर", with or without a relative's prefix.
 fn is_name_label(text: &str) -> bool {
     let compact: String = text.chars().filter(|c| !c.is_whitespace() && *c != ',').collect();
     compact.contains("नामथर") && !looks_like_noise(text)
 }
 
-/// The value of the name label at `label_index`: whatever follows its own
-/// colon, then every box on the same visual row to its right, left to
-/// right, up to the next label on that row.
+/// Name label's own tail plus every box to its right on the same row, up to the next label.
 fn row_value(lines: &[OcrLine], label_index: usize) -> Option<String> {
     let label = Bounds::from_line(&lines[label_index]);
     let own = {
@@ -215,8 +177,7 @@ fn row_value(lines: &[OcrLine], label_index: usize) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-/// A box that starts the next label on the same row (sex beside the
-/// holder's name, address/citizenship beside a parent's).
+/// Box that starts the next label on the row.
 fn is_row_stop(text: &str) -> bool {
     text.starts_with("लि")
         || ["लिङ्ग", "ठेगाना", "नागरिकता", "ना.प्र"].iter().any(|keyword| contains_keyword(text, keyword))
@@ -224,9 +185,7 @@ fn is_row_stop(text: &str) -> bool {
         || text.contains('ः')
 }
 
-/// The sex box ("लिङ्गः पुरुष") — the label itself reads too mangled for
-/// the generic keyword search on the old print ("लिडङ्ः"), but the value
-/// word is distinctive enough to anchor on when the box starts with "लि".
+/// Sex box: the label OCRs too mangled ("लिडङ्ः"), so anchor on a box starting "लि" + gender word.
 fn gender_from_row(lines: &[OcrLine]) -> Option<String> {
     lines.iter().filter(|line| line.text.starts_with("लि")).find_map(|line| {
         line.text
@@ -235,9 +194,7 @@ fn gender_from_row(lines: &[OcrLine]) -> Option<String> {
     })
 }
 
-/// "ना.प्र.प.नं" on the back; on the front, an unlabeled number row above
-/// the first name label. Only a value that reads cleanly as digits and
-/// separators is returned — a partly misread number is worse than none.
+/// Labelled back number or unlabeled front number; only clean digit reads (else none).
 fn citizenship_number(lines: &[OcrLine]) -> Option<String> {
     let labeled = lines
         .iter()
@@ -263,12 +220,8 @@ fn clean_number(text: &str) -> Option<String> {
     (clean && digits >= 6).then(|| converted.split_whitespace().collect::<Vec<_>>().join(""))
 }
 
-/// The line most likely to hold the holder's citizenship number, for the
-/// OCR engine to re-read at higher fidelity when no clean number came out of
-/// the normal pass: the first line, in reading order, carrying 8+ digits
-/// that isn't a date. Labels are deliberately not required — the old
-/// back's "ना.प्र.प.नं" read as "नपत"/"ना्पन"/"ना.प्र प न" across real
-/// scans, and the old front prints the number with no label at all.
+/// First line with 8+ digits that isn't a date — the number line to re-read. No label required
+/// (the old label never OCRs reliably; the old front has none).
 pub fn number_line(lines: &[OcrLine]) -> Option<usize> {
     lines.iter().position(|line| {
         let text = devanagari_digits_to_ascii(&line.text);
@@ -281,15 +234,8 @@ pub fn number_line(lines: &[OcrLine]) -> Option<usize> {
     })
 }
 
-/// Majority vote over several independent reads of the same number line
-/// (`(text, confidence)`, from differently-cropped copies — see
-/// `local_ocr::reread_citizenship_number`). One read of this italic,
-/// smudged print is unreliable: across real crops the "/" came back as
-/// "४", "८", "^", "×", "\\" or nothing, and single digits flipped
-/// (१ -> ९). But the misreads scatter while the correct digits repeat, so
-/// the digit sequence most reads agree on wins (it needs 3+ votes and a
-/// strict lead), and its formatting comes from the agreeing reads — any
-/// single symbol between two digit runs is the printed separator.
+/// Majority vote over many reads of the number line: misreads scatter, the true digits repeat.
+/// Needs 3+ votes and a strict lead; separator taken from the agreeing reads.
 pub fn vote_number(reads: &[(String, f32)]) -> Option<String> {
     let mut tally: Vec<(String, usize, f32, Vec<String>)> = Vec::new();
     for (text, confidence) in reads {
@@ -319,9 +265,8 @@ pub fn vote_number(reads: &[(String, f32)]) -> Option<String> {
     Some(best_form.unwrap_or_else(|| key.clone()))
 }
 
-/// The digits of one read from its first digit to its last, with each run
-/// of non-digits between them collapsed to one separator ("-" if that run
-/// has one, else "/"; whitespace alone is dropped). `None` below 8 digits.
+/// Digits of one read; each non-digit run between them -> one separator ("-" if present, else "/").
+/// `None` below 8 digits.
 fn format_number_read(text: &str) -> Option<String> {
     let converted = devanagari_digits_to_ascii(text);
     let start = converted.find(|c: char| c.is_ascii_digit())?;
@@ -346,8 +291,7 @@ fn format_number_read(text: &str) -> Option<String> {
     (out.chars().filter(char::is_ascii_digit).count() >= 8).then_some(out)
 }
 
-/// Strips label punctuation that leaked into a value ("- काठमाण्डौ") and
-/// drops values that are themselves just a label.
+/// Strips leaked label punctuation; drops values that are just a label.
 fn tidy(mut doc: CitizenshipDocument) -> CitizenshipDocument {
     for field in [
         &mut doc.full_name,
@@ -381,9 +325,7 @@ mod tests {
         }
     }
 
-    /// The old front page as the recognizer actually returned it from a
-    /// real scan (raw crop, upright), in its post-sort order — values
-    /// sorted ahead of their labels included.
+    /// Real OCR output of the old front (raw, upright), post-sort order.
     fn old_front_lines() -> Vec<OcrLine> {
         vec![
             line("नेपाल सरकार", 700, 80, 300),
@@ -413,10 +355,8 @@ mod tests {
 
     #[test]
     fn primary_extraction_misses_the_old_layout() {
-        // Guards the premise of this module: if the primary path ever
-        // starts reading this layout itself, the fallback should be
-        // revisited rather than silently overriding it.
-        let doc = super::super::extract(&old_front_lines());
+        // If the primary parser ever reads this layout, revisit the fallback.
+        let doc = extract(&old_front_lines());
         assert!(doc.full_name.is_none() || doc.full_name.as_deref() != Some("अविनाश थापा मगर"));
     }
 
@@ -458,9 +398,7 @@ mod tests {
 
     #[test]
     fn positional_name_rows_are_left_alone_on_the_newer_layout() {
-        // A newer-layout front whose holder/father rows went unread: the
-        // first "नाम थर" left is the mother's, which must not be assigned
-        // to the holder or father by position.
+        // Newer-layout front: positional names must not apply.
         let lines = vec![
             line("गा.पा: बढैयाताल", 100, 300, 400),
             line("आमाको नाम थर: फुलमाया अधिकारी", 100, 600, 700),
@@ -473,7 +411,7 @@ mod tests {
 
     #[test]
     fn number_vote_recovers_the_printed_number_from_noisy_reads() {
-        // Actual reads of the old back's number from real crop variants.
+        // Real reads of the old back's number.
         let reads: Vec<(String, f32)> = [
             "ना.प्र प न: २७१०६०९९८६",
             "न २७१०६०×९९८६",

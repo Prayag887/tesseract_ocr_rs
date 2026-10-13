@@ -2,3 +2,4 @@
 scanned_document/*.jpg
 test_images/
 .cargo/config.toml
+CLAUDE.md

@@ -8,37 +8,28 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::fields::{self, CitizenshipDocument};
-use crate::local_ocr::LocalOcrEngine;
+use crate::extraction::Extractor;
 use crate::scanner;
 
-/// A scan's original upload and current crop, held in memory for the
-/// lifetime of one scan/crop/extract session — never written to disk. An
-/// earlier version persisted these as `{id}.jpg`/`{id}_original.jpg` files
-/// under `output_dir`, deleted again by `extract`; that meant every
-/// abandoned scan (uploaded, never extracted) left an orphaned file behind
-/// permanently, and — worse — `output_dir` in production is a persistent
-/// Docker volume, so those orphans survived container recreates too. This
-/// data was never meant to outlive one request cycle; it shouldn't have
-/// been touching disk (or a volume-backed mount) in the first place.
+/// Upload and current crop for one scan/crop/extract cycle — memory only, never disk
+/// (files orphaned by abandoned scans used to pile up on the production volume).
 struct ScanEntry {
     original: Vec<u8>,
     crop: Vec<u8>,
-    /// The corner detector found nothing and the crop is just the whole
-    /// upload — re-reading the original in `extract`'s fallback would only
-    /// repeat the same OCR, so it's skipped.
+    /// No corners detected: the crop is the whole upload, so the original-upload retry is skipped.
     crop_is_full_frame: bool,
 }
 
 pub struct AppState {
     pub detector: scanner::DocDetector,
-    pub ocr: LocalOcrEngine,
+    pub extractor: Extractor,
     pub processing_permits: tokio::sync::Semaphore,
     scans: tokio::sync::Mutex<HashMap<Uuid, ScanEntry>>,
 }
 
 impl AppState {
-    pub fn new(detector: scanner::DocDetector, ocr: LocalOcrEngine, processing_permits: tokio::sync::Semaphore) -> Self {
-        Self { detector, ocr, processing_permits, scans: tokio::sync::Mutex::new(HashMap::new()) }
+    pub fn new(detector: scanner::DocDetector, extractor: Extractor, processing_permits: tokio::sync::Semaphore) -> Self {
+        Self { detector, extractor, processing_permits, scans: tokio::sync::Mutex::new(HashMap::new()) }
     }
 }
 
@@ -49,8 +40,7 @@ pub struct ScanResponse {
     corners_detected: bool,
     width: i32,
     height: i32,
-    /// Crop corners in the *original* upload's pixel space, ordered
-    /// [top-left, top-right, bottom-right, bottom-left], as [x, y] pairs.
+    /// Original-upload pixels, TL/TR/BR/BL, as [x, y].
     corners: [[f32; 2]; 4],
     orig_width: i32,
     orig_height: i32,
@@ -97,9 +87,7 @@ pub async fn scan(
         .expect("processing semaphore is never closed");
 
     let state_for_scan = state.clone();
-    // Kept for /crop to re-derive the crop from without re-uploading and
-    // without compounding JPEG re-encode loss — cloned once here since the
-    // blocking task below consumes `image_bytes`.
+    // Kept so /crop can re-warp without re-encoding loss.
     let original = image_bytes.clone();
     let output = tokio::task::spawn_blocking(move || {
         scanner::scan_document(&state_for_scan.detector, &image_bytes)
@@ -147,10 +135,7 @@ pub async fn crop(
 
     let filename = format!("{id}.jpg");
     let response = CropResponse { filename, width: output.width, height: output.height };
-    // The id must still exist (checked above) unless it was deleted by a
-    // concurrent /extract for the same id — an unlikely enough race for
-    // this single-user flow that silently no-op'ing beats adding locking
-    // just to guard it.
+    // Gone only if a concurrent /extract removed it; ignored.
     if let Some(entry) = state.scans.lock().await.get_mut(&id) {
         entry.crop = output.jpeg_bytes;
         entry.crop_is_full_frame = false;
@@ -161,9 +146,7 @@ pub async fn crop(
 
 #[derive(Deserialize)]
 pub struct ExtractQuery {
-    /// `"front"` or `"back"` — only affects which debug-preprocessed-image
-    /// filename gets overwritten (see `local_ocr::extract_blocking`), not
-    /// the extraction logic itself.
+    /// "front" or "back"; only names the debug image.
     side: Option<String>,
 }
 
@@ -182,26 +165,11 @@ pub async fn extract(
         .acquire()
         .await
         .expect("processing semaphore is never closed");
-    let mut document = state.ocr.extract(&image, query.side.as_deref()).await?;
+    let original = (!crop_is_full_frame).then_some(original.as_slice());
+    let document = tokio::task::block_in_place(|| {
+        state.extractor.extract_document(&image, original, query.side.as_deref())
+    })?;
 
-    // Last-resort fallback for a crop that still reads as near-empty: the
-    // corner detector can lock onto a strong rectangle *inside* the card
-    // instead of its edges (confirmed on an old-format back page, where it
-    // cropped to the fingerprint box), leaving the OCR only a corner of the
-    // text. Re-reading the untouched upload recovers that case; it's kept
-    // only if it strictly beats the crop, so a good crop is never replaced.
-    let populated = fields::populated_fields(&document);
-    if state.ocr.fallback_enabled() && populated < fields::LOW_YIELD_FIELDS && !crop_is_full_frame {
-        let from_original = state.ocr.extract(&original, query.side.as_deref()).await?;
-        let count = fields::populated_fields(&from_original);
-        tracing::info!(count, crop = populated, "low-yield OCR fallback on original upload");
-        if count > populated {
-            document = from_original;
-        }
-    }
-
-    // Nothing about a scanned citizenship certificate needs to persist past
-    // its own extraction.
     state.scans.lock().await.remove(&id);
 
     Ok(Json(document))
@@ -213,8 +181,7 @@ pub struct CombineRequest {
     back: Option<CitizenshipDocument>,
 }
 
-/// Merges a front-side and back-side `/extract` result into one document —
-/// see `fields::combine` for which side wins per field.
+/// Merges front and back `/extract` results (see `fields::combine`).
 pub async fn combine(Json(req): Json<CombineRequest>) -> Json<CitizenshipDocument> {
     let front = req.front.unwrap_or_default();
     let back = req.back.unwrap_or_default();

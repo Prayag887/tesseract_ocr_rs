@@ -1,30 +1,10 @@
-//! One place where every ONNX Runtime session in this service gets its memory
-//! behavior set.
-//!
-//! Sessions used to be built from a bare `Session::builder()` — ORT's
-//! defaults, which assume one model with a whole machine to itself. This
-//! container runs five sessions (det, textline-orientation, the recognition
-//! worker pool, and `scanner`'s corner detector) next to two sibling services
-//! on one small VM, where those defaults cost far more than they buy:
-//!
-//! - The **CPU arena allocator** (on by default) never returns freed
-//!   activations to malloc. RSS settles at the high-water mark of the largest
-//!   image the process has ever seen and stays there for the container's life.
-//!   Disabled at the environment level below, so every session inherits it.
-//! - **Memory pattern** planning (on by default) pre-reserves activation
-//!   buffers sized for the largest input shape a session has run. Detection
-//!   input is variable and capped only by `OCR_DET_MAX_SIDE`, so a single
-//!   large upload permanently reserves buffers sized for it.
-//! - `intra_threads` defaults to the logical CPU count (8 on the current
-//!   host). That is *per session*: five sessions meant up to 40 ORT worker
-//!   threads per container, each carrying its own allocation state, to serve
-//!   the at-most-`OCR_MAX_CONCURRENCY` (2) requests actually in flight. The
-//!   environment's global thread pool replaces them with one shared pool.
-//!
-//! Every knob is env-overridable so a regression can be bisected against the
-//! old behavior without a rebuild: `ORT_CPU_ARENA=true`,
-//! `ORT_MEMORY_PATTERN=true`, `ORT_INTRA_THREADS=8`, `ORT_INTER_THREADS=8`
-//! restores what the defaults did.
+//! Shared ONNX Runtime setup for every session. ORT's defaults assume one model per machine;
+//! here they cost memory, so:
+//! - CPU arena off (it never returns freed activations),
+//! - memory-pattern planning off (reserves buffers for the largest input ever seen),
+//! - one small global thread pool instead of a per-session pool sized to the CPU count.
+//! Restore the defaults with `ORT_CPU_ARENA=true ORT_MEMORY_PATTERN=true ORT_INTRA_THREADS=8
+//! ORT_INTER_THREADS=8`.
 
 use ort::environment::GlobalThreadPoolOptions;
 use ort::ep::CPU;
@@ -32,24 +12,13 @@ use ort::session::builder::{PrepackedWeights, SessionBuilder};
 
 use crate::error::AppError;
 
-/// Intra-op threads for the shared global pool. This is the whole process's
-/// budget, not a per-session one. Two matches `OCR_MAX_CONCURRENCY`'s default:
-/// there is no point having more parallelism inside an operator than there are
-/// requests allowed to be in flight.
+/// Process-wide intra-op threads; matches the default `OCR_MAX_CONCURRENCY` (2).
 const DEFAULT_INTRA_THREADS: usize = 2;
-/// Inter-op threads. Only used when a session runs independent branches of its
-/// graph concurrently, which needs `with_parallel_execution` — never enabled
-/// for any session here — so one is enough.
+/// Inter-op threads; unused without parallel execution, which no session enables.
 const DEFAULT_INTER_THREADS: usize = 1;
 
-/// Installs the process-wide ONNX Runtime environment.
-///
-/// Must be called before the first session is built: `ort` creates a default
-/// environment lazily on first use, and
-/// [`commit`](ort::environment::EnvironmentBuilder::commit) is a no-op once
-/// that has happened — it returns `false` rather than failing, which is why
-/// the flag is logged instead of ignored. A `committed=false` line means some
-/// earlier code already built a session and none of this took effect.
+/// Installs the global ORT environment. Must run before the first session is built, or it's a
+/// no-op (logged as `committed=false`).
 pub fn init_runtime() -> Result<(), AppError> {
     let intra_threads = env_usize("ORT_INTRA_THREADS", DEFAULT_INTRA_THREADS).clamp(1, 64);
     let inter_threads = env_usize("ORT_INTER_THREADS", DEFAULT_INTER_THREADS).clamp(1, 64);
@@ -62,10 +31,7 @@ pub fn init_runtime() -> Result<(), AppError> {
     let committed = ort::init()
         .with_name("ocr")
         .with_telemetry(false)
-        // Registered on the environment rather than on each builder so a
-        // session added later cannot silently miss it. A session-level
-        // execution provider would take precedence over this, so no session
-        // here sets one.
+        // On the environment, so every session inherits it.
         .with_execution_providers([CPU::default().with_arena_allocator(cpu_arena).build()])
         .with_global_thread_pool(thread_pool)
         .commit();
@@ -80,25 +46,13 @@ pub fn init_runtime() -> Result<(), AppError> {
     Ok(())
 }
 
-/// The builder every session in this service is created from.
-///
-/// Deliberately does *not* set `intra_threads`/`inter_threads`: with the
-/// environment's global thread pool active, ONNX Runtime ignores the
-/// session-level thread counts, so setting them here would read as if it
-/// controlled something it doesn't. [`init_runtime`] owns them.
+/// Base builder for every session. No thread settings: the global pool overrides them.
 pub fn session_builder() -> Result<SessionBuilder, AppError> {
     let memory_pattern = env_bool("ORT_MEMORY_PATTERN", false);
     Ok(SessionBuilder::new()?.with_memory_pattern(memory_pattern)?)
 }
 
-/// Builder for one recognition-pool worker.
-///
-/// The pool is N sessions over the *same* `devanagari_rec.onnx`. Handing every
-/// worker the same [`PrepackedWeights`] container makes ORT prepack that
-/// model's weights once and share the result across the pool, rather than each
-/// session materializing its own copy of identical repacked buffers — the
-/// largest duplicate allocation in this process, since the pool is the one
-/// place a single model is loaded more than once.
+/// Recognition-pool worker; shared [`PrepackedWeights`] so the pool stores one copy of the weights.
 pub fn rec_session_builder(weights: &PrepackedWeights) -> Result<SessionBuilder, AppError> {
     Ok(session_builder()?.with_prepacked_weights(weights)?)
 }

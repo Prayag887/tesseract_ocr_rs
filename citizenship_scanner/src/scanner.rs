@@ -8,52 +8,27 @@ use ort::value::Tensor;
 
 use crate::error::AppError;
 
-/// Result of a document scan: the perspective-corrected, encoded image bytes
-/// and whether the model actually found a document (vs. falling back to the
-/// full frame).
+/// Perspective-corrected JPEG of the card, plus whether corners were actually detected.
 pub struct ScanOutput {
     pub jpeg_bytes: Vec<u8>,
     pub corners_detected: bool,
     pub width: i32,
     pub height: i32,
-    /// Corners used for the crop, in the *original* image's pixel space,
-    /// ordered [top-left, top-right, bottom-right, bottom-left]. Present
-    /// even when detection failed (falls back to the full-image rect) so
-    /// callers always have a starting quad to show/adjust.
+    /// Crop corners in original-image pixels, TL/TR/BR/BL. Full-image rect if detection failed.
     pub corners: [(f32, f32); 4],
     pub orig_width: i32,
     pub orig_height: i32,
 }
 
-/// Wraps the loaded corner-detection network. `dnn::Net` is a handle to
-/// mutable OpenCV state (`forward()` needs `&mut self`), so concurrent
-/// requests share one instance behind a mutex rather than each loading
-/// their own copy — reloading from disk is pure overhead once the weights
-/// are already in memory.
+/// Card-corner model; one shared session behind a mutex (ONNX `run` needs `&mut`).
 pub struct DocDetector(Mutex<Session>);
 
-/// DocAligner's `lcnet100` heatmap-regression model (Apache-2.0,
-/// github.com/DocsaidLab/DocAligner): a PP-LCNet-1.0 backbone + BiFPN neck
-/// predicting one heatmap per corner rather than regressing point
-/// coordinates directly. DocAligner's own README documents why: a
-/// point-regression head trained at a fixed low resolution (256x256)
-/// suffers "amplification error" — a ~5-10px shift once the predicted
-/// point is scaled back up to the original photo's resolution, since a
-/// whole neighborhood of source pixels collapses to one predicted pixel.
-/// A heatmap only has to say "the corner is roughly here", so upscaling
-/// its centroid to the original resolution doesn't carry that fixed
-/// pixel-error term. In practice, an A/B test against the original
-/// point-regression `lcnet050` and the much heavier `fastvit_sa24` variant
-/// found identical field-extraction accuracy across all three on a
-/// 105-image batch — so `lcnet100` was kept for being the same weight class
-/// as the original model with no measured downside, not for a proven
-/// accuracy win. Runs at the same fixed 256x256 input as the point model it
-/// replaces.
+/// DocAligner `lcnet100` (Apache-2.0): one heatmap per corner instead of point regression, which
+/// avoids the ~5-10px error of upscaling a 256x256 point prediction. Same accuracy as the
+/// alternatives in an A/B on 105 images; kept for its size.
 const MODEL_PATH: &str = "models/docaligner_lcnet100.onnx";
 const MODEL_INPUT_SIZE: i32 = 256;
-/// Below this, a corner's heatmap is treated as empty (no document edge
-/// found there) — matches DocAligner's own reference postprocessing
-/// (`heatmap_threshold` in `heatmap_reg/infer.py`).
+/// Heatmap values below this count as empty (DocAligner reference value).
 const HEATMAP_THRESHOLD: f64 = 0.3;
 
 impl DocDetector {
@@ -62,18 +37,12 @@ impl DocDetector {
         Ok(Self(Mutex::new(net)))
     }
 
-    /// Runs the model on `image` (full resolution — the fixed 256x256 input
-    /// means there's no separate "detection copy" to manage) and returns
-    /// its 4 corners in `image`'s own pixel space, or `None` if any of the
-    /// 4 corners' heatmaps came back empty (no document found there).
+    /// The 4 corners in `image` pixels, or `None` if any corner heatmap is empty.
     fn detect(&self, image: &Mat) -> Result<Option<[Point2f; 4]>, AppError> {
         let size = image.size().map_err(AppError::Processing)?;
         let (orig_w, orig_h) = (size.width, size.height);
 
-        // Same preprocessing as the point model this replaces: scale to
-        // [0,1], no mean/std subtraction (DocAligner's heatmap preprocess
-        // is a plain `/255`), BGR->RGB since imdecode gives BGR and the
-        // model was trained on RGB.
+        // DocAligner preprocessing: RGB, scaled to [0,1], no mean/std.
         let mut resized_bgr = Mat::default();
         imgproc::resize(
             image,
@@ -95,10 +64,7 @@ impl DocDetector {
         let t_fwd = std::time::Instant::now();
         let mut net = self.0.lock().expect("ort Session mutex poisoned");
         let outputs = net.run(ort::inputs!["img" => input])?;
-        // heatmap is [1, 4, H, W] — one channel per corner, in
-        // [top-left, top-right, bottom-right, bottom-left] order (verified
-        // against a real scan: each channel's peak lands where that corner
-        // visually is). Already sigmoid-activated by the exported graph.
+        // [1, 4, H, W], channels TL/TR/BR/BL, already sigmoid-activated.
         let (shape, heatmap) = outputs["heatmap"].try_extract_tensor::<f32>()?;
         let (map_h, map_w) = (shape[2] as i32, shape[3] as i32);
         let heatmap = heatmap.to_vec();
@@ -130,15 +96,8 @@ impl DocDetector {
     }
 }
 
-/// Extracts channel `channel` of a `[1, 4, H, W]` heatmap tensor, upscales
-/// it to the original image's resolution, thresholds it, and returns the
-/// centroid of its largest connected blob — DocAligner's own
-/// heatmap-to-corner postprocessing (`heatmap_reg/infer.py`: resize,
-/// threshold, binarize, take the largest-area polygon's centroid).
-/// Upscaling *before* thresholding (rather than finding a peak at the
-/// heatmap's native low resolution and scaling that single point up) is
-/// what avoids reintroducing the same fixed pixel-error the heatmap
-/// architecture exists to avoid.
+/// Centroid of the largest blob in one corner heatmap, upscaled to image size *before*
+/// thresholding (as DocAligner does) so no low-res pixel error is reintroduced.
 fn largest_heatmap_blob_centroid(
     heatmap: &[f32],
     channel: usize,
@@ -148,9 +107,6 @@ fn largest_heatmap_blob_centroid(
     orig_h: i32,
 ) -> Result<Option<Point2f>, AppError> {
     let plane_len = (map_h * map_w) as usize;
-    // heatmap is a contiguous [1, 4, H, W] tensor fresh off the network, so
-    // it can be read as one flat row-major slice and sliced per channel
-    // rather than indexed element-by-element.
     let start = channel * plane_len;
     let plane = &heatmap[start..start + plane_len];
     let plane_mat = Mat::new_rows_cols_with_data(map_h, map_w, plane)?.try_clone()?;
@@ -208,13 +164,7 @@ fn largest_heatmap_blob_centroid(
     )))
 }
 
-/// The model's predicted edge tends to land a hair inside the document's
-/// true boundary rather than exactly on it (regression models trained on
-/// human-labeled corners systematically do this — annotators tend to click
-/// slightly inside a busy edge/text region), which was visibly clipping a
-/// sliver of text on some scans. Pushes each corner outward from the quad's
-/// own center by [`CORNER_EXPAND_FRACTION`], clamped back to the image
-/// bounds, to compensate.
+/// Predicted edges land slightly inside the card; push corners out by this fraction of the quad.
 const CORNER_EXPAND_FRACTION: f32 = 0.025;
 const MAX_CROP_DIMENSION: f64 = 16_384.0;
 const MIN_CROP_EDGE: f64 = 2.0;
@@ -229,8 +179,7 @@ fn expand_quad(corners: [Point2f; 4], width: f32, height: f32) -> [Point2f; 4] {
     })
 }
 
-/// Packs a resized RGB `u8` `Mat` into an NCHW `f32` tensor, scaled to
-/// `[0,1]` with no mean/std subtraction — DocAligner's heatmap preprocess.
+/// RGB u8 -> NCHW f32 in `[0, 1]`.
 fn scale_nchw(rgb: &Mat) -> Result<Vec<f32>, AppError> {
     let rows = rgb.rows();
     let cols = rgb.cols();
@@ -265,17 +214,8 @@ pub fn scan_document(detector: &DocDetector, bytes: &[u8]) -> Result<ScanOutput,
 
     let t1 = std::time::Instant::now();
     let (corners_full, corners_detected) = match detector.detect(&original)? {
-        // The heatmap model can report all 4 corners "found" (none of the
-        // 4 channels came back empty) while still producing a degenerate
-        // quad — confirmed against a real photo whose visible document
-        // fills almost the entire frame with barely any border: two of the
-        // four corner heatmaps peaked at nearly the same pixel, and the
-        // sum/difference corner-ordering trick above then assigned that
-        // single point to two different corner roles, collapsing the quad
-        // to zero area. `detector.detect` returning `Some` only means each
-        // *individual* heatmap had a peak, not that the *combined* quad is
-        // a sane document boundary — check that here, the same way a
-        // manually-submitted crop already gets checked in `validate_crop`.
+        // All 4 heatmaps can peak while two land on the same pixel (card filling the frame),
+        // collapsing the quad — validate before trusting it.
         Some(corners) if !quad_is_degenerate(&corners) => (corners, true),
         _ => (full_frame_corners(&original)?, false),
     };
@@ -312,10 +252,7 @@ pub fn scan_document(detector: &DocDetector, bytes: &[u8]) -> Result<ScanOutput,
     })
 }
 
-/// Re-warps an already-decoded original image against caller-supplied
-/// corners (e.g. after the user manually adjusted the auto-detected crop).
-/// Corners are in the original image's pixel space, any order, and need not
-/// be axis-aligned; they are used as-is for the perspective transform.
+/// Re-warps the original against user-adjusted corners (original-image pixels, any order).
 pub fn crop_with_corners(bytes: &[u8], corners: [(f32, f32); 4]) -> Result<ScanOutput, AppError> {
     let buf = Vector::<u8>::from_slice(bytes);
     let original = imgcodecs::imdecode(&buf, imgcodecs::IMREAD_COLOR).map_err(AppError::Decode)?;
@@ -383,16 +320,8 @@ fn validate_crop(
     Ok(())
 }
 
-/// True if `corners` don't enclose a real quadrilateral — either collapsed
-/// to a point/line, self-intersecting, or otherwise too thin to be a
-/// plausible document boundary. Two checks, since they catch different
-/// failure shapes: the shoelace-formula area check alone doesn't catch a
-/// quad where exactly two of the four corners landed on the same pixel —
-/// confirmed against a real detection, where that produced only 3 distinct
-/// points, which the shoelace sum happily computed as a *triangle's* area
-/// (nonzero, often large), not zero — so a plain area floor let it through
-/// as if it were a valid quad. The pairwise-distance check below catches
-/// that shape directly instead of relying on its side effect on area.
+/// Collapsed, self-intersecting or too-thin quads. Needs both checks: two corners on the same
+/// pixel make a triangle whose shoelace area looks fine.
 const MIN_QUAD_TWICE_AREA: f32 = 4.0;
 const MIN_QUAD_CORNER_SEPARATION: f32 = 2.0;
 
@@ -429,9 +358,7 @@ fn full_frame_corners(image: &Mat) -> Result<[Point2f; 4], AppError> {
     ])
 }
 
-/// Orders 4 arbitrary points as [top-left, top-right, bottom-right, bottom-left]
-/// using the sum/difference trick: top-left has the smallest x+y, bottom-right
-/// the largest; top-right has the smallest x-y, bottom-left the largest.
+/// Orders as TL/TR/BR/BL: TL = min x+y, BR = max x+y, TR = max x-y, BL = min x-y.
 fn order_corners(points: &[Point2f; 4]) -> [Point2f; 4] {
     let top_left = *points
         .iter()
@@ -457,15 +384,11 @@ fn dist(a: Point2f, b: Point2f) -> f64 {
     (((a.x - b.x).powi(2) + (a.y - b.y).powi(2)) as f64).sqrt()
 }
 
-/// Applies a perspective transform so the quadrilateral defined by `corners`
-/// (top-left, top-right, bottom-right, bottom-left) fills a fresh
-/// axis-aligned output image, i.e. a top-down "scan" of the document.
+/// Warps the TL/TR/BR/BL quad into an axis-aligned top-down image.
 fn warp_document(image: &Mat, corners: &[Point2f]) -> Result<Mat, AppError> {
     let [tl, tr, br, bl] = [corners[0], corners[1], corners[2], corners[3]];
 
-    // Corner coordinates address pixel centers and are inclusive. A full-width
-    // edge from x=0 through x=2159 therefore contains 2160 pixels even though
-    // the Euclidean distance between the endpoint centers is 2159.
+    // Corners are inclusive pixel centres: x=0..2159 is 2160 px wide, hence +1.
     let width = dist(br, bl).max(dist(tr, tl)).round() as i32 + 1;
     let height = dist(tr, br).max(dist(tl, bl)).round() as i32 + 1;
     let width = width.max(1);

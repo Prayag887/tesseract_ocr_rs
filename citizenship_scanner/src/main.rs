@@ -1,6 +1,9 @@
 mod error;
+mod extraction;
 mod fields;
-mod local_ocr;
+#[cfg(test)]
+mod golden_tests;
+mod ocr;
 mod ort_config;
 mod preprocess;
 mod routes;
@@ -18,24 +21,21 @@ use tower_http::trace::TraceLayer;
 use routes::AppState;
 
 const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024; // 25 MB
-/// Distinct from the NID service's port (3000) and the passport service's
-/// port (3003) so all three can run side by side on one host during local
-/// dev.
+/// NID uses 3000, passport 3003.
 const DEFAULT_PORT: u16 = 3004;
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    // Before any session is built — `ort` installs a default environment
-    // lazily on first use, and this is a no-op afterwards.
+    // Before any session is built (no-op afterwards).
     ort_config::init_runtime().expect("failed to configure ONNX Runtime");
 
     let output_dir = std::path::PathBuf::from("scanned_document");
     std::fs::create_dir_all(&output_dir).expect("failed to create scanned_document directory");
 
     let detector = scanner::DocDetector::load().expect("failed to load document detection model");
-    let ocr = local_ocr::LocalOcrEngine::load(output_dir.clone()).expect("failed to load OCR models");
+    let extractor = extraction::Extractor::load(output_dir.clone()).expect("failed to load OCR models");
     let max_concurrency = std::env::var("OCR_MAX_CONCURRENCY")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -43,7 +43,7 @@ async fn main() {
         .clamp(1, 64);
     tracing::info!(max_concurrency, "image-processing concurrency configured");
 
-    let state = Arc::new(AppState::new(detector, ocr, tokio::sync::Semaphore::new(max_concurrency)));
+    let state = Arc::new(AppState::new(detector, extractor, tokio::sync::Semaphore::new(max_concurrency)));
 
     let app = Router::new()
         .route("/health", get(routes::health))
@@ -55,10 +55,7 @@ async fn main() {
         .fallback_service(ServeDir::new("static"))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(TraceLayer::new_for_http())
-        // Permissive for the same reason as the NID/passport services: this
-        // is reached only through the shared gateway today, not exposed
-        // directly. Tighten to an explicit origin allowlist before that
-        // changes.
+        // Only reached through the gateway; tighten before exposing directly.
         .layer(CorsLayer::permissive())
         .with_state(state);
 
